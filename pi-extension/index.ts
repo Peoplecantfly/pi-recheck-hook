@@ -1,12 +1,13 @@
-// © {proj:"ai_kit", path:"pi-recheck-hook/pi-extension/index.ts", kind:"code", created:"2026-10-14", note:"Huki hooks for pi: end-of-turn recheck + post-compaction anchor. Port of workshop/huki/opencode/fabrika-huki.js. Prompt texts live in ../assets/."}
+// © {proj:"ai_kit", path:"pi-recheck-hook/pi-extension/index.ts", kind:"code", created:"2026-10-14", note:"Recheck + anchor hooks for pi: end-of-turn recheck + post-compaction anchor. Port of the workshop OpenCode plugin. Prompt texts live in ../assets/."}
 //
-// Huki hooks for pi (port of the OpenCode plugin).
+// Recheck + anchor hooks for pi (port of the OpenCode plugin).
 //
-// The spec lives in the sibling huki.md; this file only implements it.
+// The spec lives in the workshop markdown file beside that plugin; this file
+// only implements it.
 //   1. Recheck: the agent finished a turn and waits for a human → send the
 //      "verify against facts, not from memory" prompt. Once per turn.
 //      Not in subagents, not right after a summary, not after an error.
-//      Disabled with HUKI_RECHECK=0.
+//      Disabled with PI_RECHECK=0.
 //   2. Anchor: after compaction inject a message without a model reply so
 //      work continues from the task files, not from the summary.
 //
@@ -16,7 +17,8 @@
 //      into the compaction protocol and handler-returned `customInstructions`
 //      are ignored (agent-session.js:2257). Instead the anchor is injected
 //      into the history right AFTER compaction (`session_compact`), which is
-//      what Huki actually requires: keep the message, don't trust the summary.
+//      what the anchor requirement actually calls for: keep the message,
+//      don't trust the summary.
 //   · OpenCode detected subagents via `session.parentID`. Pi has no such
 //      link; child sessions launch with PI_SUBAGENT_SESSION / PI_SUBAGENT_ID /
 //      PI_SUBAGENT_NAME / PI_SUBAGENT_AGENT env vars
@@ -41,8 +43,8 @@ import { join } from "node:path";
 
 /**
  * Prompt texts are not pinned in code — `assets/recheck.md` and
- * `assets/anchor.md` hold them (English rendering of the blocks in huki.md
- * §1/§2; the originals there are Russian).
+ * `assets/anchor.md` hold them (English rendering of the two blocks in the
+ * workshop spec file; the originals there are Russian).
  *
  * Resolution chain, checked per asset; first location that contains the file
  * wins, none → empty string → the handler stays silent:
@@ -210,13 +212,13 @@ function lastEntryWithMessages(entries: AnyEntry[]): AnyEntry | undefined {
 
 // ==================== HOOK 1: RECHECK ====================
 
-export default function hukiHooks(pi: ExtensionAPI): void {
+export default function recheckHooks(pi: ExtensionAPI): void {
 	const recheckedEntries = new Set<string>();
 	const anchoredCompactions = new Set<string>();
 
 	pi.on("agent_before_settle", (event, ctx) => {
 		const { recheck, anchor } = resolveAssets(ctx.cwd);
-		if (process.env.HUKI_RECHECK === "0") return; // disabled
+		if (process.env.PI_RECHECK === "0") return; // disabled
 		if (!recheck) return; // prompt file missing — stay silent
 		if (!hasTaskFiles(ctx.cwd)) return; // foreign repository
 		if (isSubagent()) return; // main session only
@@ -247,7 +249,7 @@ export default function hukiHooks(pi: ExtensionAPI): void {
 			entries: [
 				{
 					type: "custom_message",
-					customType: "huki:recheck",
+					customType: "pi-recheck:recheck",
 					content: [{ type: "text", text: recheck }],
 					display: true,
 					details: { hook: "recheck", entryId: key },
@@ -272,7 +274,7 @@ export default function hukiHooks(pi: ExtensionAPI): void {
 		// No triggerTurn: the message stays in the history but asks for no reply.
 		pi.sendMessage(
 			{
-				customType: "huki:anchor",
+				customType: "pi-recheck:anchor",
 				content: [{ type: "text", text: anchor }],
 				display: true,
 				details: { hook: "anchor", compactionId: key },

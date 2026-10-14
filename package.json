@@ -3,11 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Huki hooks for pi: end-of-turn recheck + post-compaction anchor.",
+  "description": "Recheck + anchor hooks for pi: end-of-turn recheck + post-compaction anchor.",
   "keywords": [
     "pi-package",
     "pi-extension",
-    "huki",
     "recheck",
     "anchor"
   ],

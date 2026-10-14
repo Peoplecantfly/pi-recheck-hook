@@ -19,7 +19,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-import hukiHooks from "../pi-extension/index.ts";
+import recheckHooks from "../pi-extension/index.ts";
 
 const REPO_ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..");
 const RECHECK_BUNDLED = join(REPO_ROOT, "assets", "recheck.md");
@@ -81,7 +81,7 @@ function compactEvent(id = "c1") {
 
 /** Clear every env marker so each test starts from a known baseline. */
 function clearEnv() {
-	delete process.env.HUKI_RECHECK;
+	delete process.env.PI_RECHECK;
 	delete process.env.PI_RECHECK_ASSETS_DIR;
 	delete process.env.PI_SUBAGENT_SESSION;
 	delete process.env.PI_SUBAGENT_ID;
@@ -167,11 +167,11 @@ test("recheck fires after a normal answer", () => {
 	clearEnv();
 	const cwd = makeProject();
 	const { pi, handlers } = makePi();
-	hukiHooks(pi);
+	recheckHooks(pi);
 	const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 	assert.ok(res, "handler returned nothing");
 	assert.equal(res.entries.length, 1);
-	assert.equal(res.entries[0].customType, "huki:recheck");
+	assert.equal(res.entries[0].customType, "pi-recheck:recheck");
 	assert.equal(res.entries[0].content[0].text, bundledRecheck());
 	assert.equal(res.continue, true);
 });
@@ -180,7 +180,7 @@ test("recheck only once per turn (same entry id twice)", () => {
 	clearEnv();
 	const cwd = makeProject();
 	const { pi, handlers } = makePi();
-	hukiHooks(pi);
+	recheckHooks(pi);
 	const first = handlers.agent_before_settle(assistantSettle("same"), { cwd });
 	assert.ok(first.entries);
 	const second = handlers.agent_before_settle(assistantSettle("same"), { cwd });
@@ -191,7 +191,7 @@ test("recheck skipped after compaction/branch_summary entry", () => {
 	clearEnv();
 	const cwd = makeProject();
 	const { pi, handlers } = makePi();
-	hukiHooks(pi);
+	recheckHooks(pi);
 	for (const type of ["compaction", "branch_summary"]) {
 		const ev = assistantSettle(`sum-${type}`);
 		ev.context.contextEntries[0].sourceEntry.type = type;
@@ -204,7 +204,7 @@ test("recheck skipped after error/aborted outcome", () => {
 	clearEnv();
 	const cwd = makeProject();
 	const { pi, handlers } = makePi();
-	hukiHooks(pi);
+	recheckHooks(pi);
 	for (const outcome of ["error", "aborted"]) {
 		const ev = assistantSettle(`bad-${outcome}`);
 		ev.outcome = outcome;
@@ -213,12 +213,12 @@ test("recheck skipped after error/aborted outcome", () => {
 	}
 });
 
-test("recheck disabled by HUKI_RECHECK=0", () => {
+test("recheck disabled by PI_RECHECK=0", () => {
 	clearEnv();
-	process.env.HUKI_RECHECK = "0";
+	process.env.PI_RECHECK = "0";
 	const cwd = makeProject();
 	const { pi, handlers } = makePi();
-	hukiHooks(pi);
+	recheckHooks(pi);
 	const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 	assert.ok(!res || !res.entries);
 });
@@ -229,10 +229,10 @@ test("anchor injected after compaction, no continuation", () => {
 	clearEnv();
 	const cwd = makeProject();
 	const { pi, handlers, sent } = makePi();
-	hukiHooks(pi);
+	recheckHooks(pi);
 	handlers.session_compact(compactEvent(), { cwd });
 	assert.equal(sent.length, 1);
-	assert.equal(sent[0].message.customType, "huki:anchor");
+	assert.equal(sent[0].message.customType, "pi-recheck:anchor");
 	assert.equal(sent[0].message.content[0].text, bundledAnchor());
 	// empty options => no triggerTurn
 	assert.notEqual(sent[0].options?.triggerTurn, true);
@@ -242,7 +242,7 @@ test("anchor once per compaction (same id twice)", () => {
 	clearEnv();
 	const cwd = makeProject();
 	const { pi, handlers, sent } = makePi();
-	hukiHooks(pi);
+	recheckHooks(pi);
 	handlers.session_compact(compactEvent("samec"), { cwd });
 	handlers.session_compact(compactEvent("samec"), { cwd });
 	assert.equal(sent.length, 1);
@@ -257,7 +257,7 @@ test("subagent sessions ignored (any PI_SUBAGENT_* set)", () => {
 		clearEnv();
 		process.env[key] = "1";
 		const { pi, handlers, sent } = makePi();
-		hukiHooks(pi);
+		recheckHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(`sub-${key}`), { cwd });
 		assert.ok(!res || !res.entries, `recheck must skip when ${key} set`);
 		handlers.session_compact(compactEvent(`sub-${key}`), { cwd });
@@ -269,7 +269,7 @@ test("foreign repository ignored (no task files)", () => {
 	clearEnv();
 	const cwd = makeProject({ taskFile: false });
 	const { pi, handlers, sent } = makePi();
-	hukiHooks(pi);
+	recheckHooks(pi);
 	const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 	assert.ok(!res || !res.entries, "recheck must skip without task files");
 	handlers.session_compact(compactEvent(), { cwd });
@@ -283,11 +283,11 @@ test("workshop-only task root still triggers recheck (project-local override)", 
 	assert.ok(existsSync(join(cwd, "workshop", "tasks", "factory", "00-obshchee.md")));
 	assert.ok(!existsSync(join(cwd, "tasks", "factory", "00-obshchee.md")), "project must not hold a top-level task file");
 	const { pi, handlers } = makePi();
-	hukiHooks(pi);
+	recheckHooks(pi);
 	const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 	assert.ok(res, "handler returned nothing");
 	assert.equal(res.entries.length, 1);
-	assert.equal(res.entries[0].customType, "huki:recheck");
+	assert.equal(res.entries[0].customType, "pi-recheck:recheck");
 	assert.equal(res.entries[0].content[0].text, "WORKSHOP RECHECK");
 	assert.equal(res.continue, true);
 });
@@ -300,7 +300,7 @@ test("project-local overrides global and bundled", async () => {
 	const cwd = makeProject({ projectAssets: { "recheck.md": "PROJECT RECHECK", "anchor.md": "PROJECT ANCHOR" } });
 	await withHome(home, () => {
 		const { pi, handlers } = makePi();
-		hukiHooks(pi);
+		recheckHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 		assert.equal(res.entries[0].content[0].text, "PROJECT RECHECK");
 	});
@@ -312,7 +312,7 @@ test("global used when no project-local", async () => {
 	const cwd = makeProject(); // no project assets
 	await withHome(home, () => {
 		const { pi, handlers } = makePi();
-		hukiHooks(pi);
+		recheckHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 		assert.equal(res.entries[0].content[0].text, "GLOBAL RECHECK");
 	});
@@ -325,7 +325,7 @@ test("bundled used as fallback", async () => {
 	const cwd = makeProject();
 	await withHome(emptyHome, () => {
 		const { pi, handlers } = makePi();
-		hukiHooks(pi);
+		recheckHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 		assert.equal(res.entries[0].content[0].text, bundledRecheck());
 	});
@@ -339,7 +339,7 @@ test("PI_RECHECK_ASSETS_DIR takes priority over project and global", async () =>
 	process.env.PI_RECHECK_ASSETS_DIR = envDir;
 	await withHome(home, () => {
 		const { pi, handlers } = makePi();
-		hukiHooks(pi);
+		recheckHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 		assert.equal(res.entries[0].content[0].text, "ENV RECHECK");
 	});
@@ -379,7 +379,7 @@ test("homedir override reaches the global candidate", async () => {
 	await withHome(home, () => {
 		assert.notEqual(homedir(), realHome);
 		const { pi, handlers } = makePi();
-		hukiHooks(pi);
+		recheckHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 		assert.equal(res.entries[0].content[0].text, "GLOBAL ONLY");
 	});
