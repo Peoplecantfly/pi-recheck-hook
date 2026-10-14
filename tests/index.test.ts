@@ -15,7 +15,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -90,15 +90,18 @@ function clearEnv() {
 }
 
 /**
- * Create a temp project dir. With `taskFile` it holds
- * tasks/factory/00-obshchee.md. With `projectAssets` it also holds
+ * Create a temp project dir. `taskFile` creates the task workspace; `root`
+ * picks which task root is used — "" for `tasks/factory/00-obshchee.md`
+ * (repo root layout), "workshop" for `workshop/tasks/factory/00-obshchee.md`
+ * (workshop-only layout). With `projectAssets` it also holds
  * .pi/pi-recheck-hook/assets/<name>. Returns cwd to use as ctx.cwd.
  */
-function makeProject({ taskFile = true, projectAssets = null } = {}) {
+function makeProject({ taskFile = true, root = "", projectAssets = null } = {}) {
 	const cwd = mkdtempSync(join(tmpdir(), "recheck-proj-"));
 	if (taskFile) {
-		mkdirSync(join(cwd, "tasks", "factory"), { recursive: true });
-		writeFileSync(join(cwd, "tasks", "factory", "00-obshchee.md"), "# obshchee\n");
+		const dir = join(cwd, root, "tasks", "factory");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "00-obshchee.md"), "# obshchee\n");
 	}
 	if (projectAssets) {
 		const dir = join(cwd, ".pi", "pi-recheck-hook", "assets");
@@ -127,14 +130,19 @@ function makeDirAssets(assets) {
 	return dir;
 }
 
-/** Run `fn` with process.env.HOME pointed at `homeDir`. */
-function withHome(homeDir, fn) {
+/**
+ * Run `fn` (sync or async) with process.env.HOME pointed at `homeDir`, and
+ * await it, so HOME is restored only after an async body has settled. If HOME
+ * was unset before, it is deleted again instead of being set to `undefined`.
+ */
+async function withHome(homeDir, fn) {
 	const prev = process.env.HOME;
 	process.env.HOME = homeDir;
 	try {
-		return fn();
+		return await fn();
 	} finally {
-		if (prev !== undefined) process.env.HOME = prev;
+		if (prev === undefined) delete process.env.HOME;
+		else process.env.HOME = prev;
 	}
 }
 
@@ -268,13 +276,29 @@ test("foreign repository ignored (no task files)", () => {
 	assert.equal(sent.length, 0, "anchor must skip without task files");
 });
 
+test("workshop-only task root still triggers recheck (project-local override)", () => {
+	clearEnv();
+	// Only workshop/tasks/... exists — no top-level tasks/ dir.
+	const cwd = makeProject({ root: "workshop", projectAssets: { "recheck.md": "WORKSHOP RECHECK" } });
+	assert.ok(existsSync(join(cwd, "workshop", "tasks", "factory", "00-obshchee.md")));
+	assert.ok(!existsSync(join(cwd, "tasks", "factory", "00-obshchee.md")), "project must not hold a top-level task file");
+	const { pi, handlers } = makePi();
+	hukiHooks(pi);
+	const res = handlers.agent_before_settle(assistantSettle(), { cwd });
+	assert.ok(res, "handler returned nothing");
+	assert.equal(res.entries.length, 1);
+	assert.equal(res.entries[0].customType, "huki:recheck");
+	assert.equal(res.entries[0].content[0].text, "WORKSHOP RECHECK");
+	assert.equal(res.continue, true);
+});
+
 // ===================== Requirement: Asset resolution chain =====================
 
-test("project-local overrides global and bundled", () => {
+test("project-local overrides global and bundled", async () => {
 	clearEnv();
 	const home = makeGlobalAssets({ "recheck.md": "GLOBAL RECHECK", "anchor.md": "GLOBAL ANCHOR" });
 	const cwd = makeProject({ projectAssets: { "recheck.md": "PROJECT RECHECK", "anchor.md": "PROJECT ANCHOR" } });
-	withHome(home, () => {
+	await withHome(home, () => {
 		const { pi, handlers } = makePi();
 		hukiHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
@@ -282,11 +306,11 @@ test("project-local overrides global and bundled", () => {
 	});
 });
 
-test("global used when no project-local", () => {
+test("global used when no project-local", async () => {
 	clearEnv();
 	const home = makeGlobalAssets({ "recheck.md": "GLOBAL RECHECK", "anchor.md": "GLOBAL ANCHOR" });
 	const cwd = makeProject(); // no project assets
-	withHome(home, () => {
+	await withHome(home, () => {
 		const { pi, handlers } = makePi();
 		hukiHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
@@ -294,12 +318,12 @@ test("global used when no project-local", () => {
 	});
 });
 
-test("bundled used as fallback", () => {
+test("bundled used as fallback", async () => {
 	clearEnv();
 	// Empty HOME (no global assets) and no project assets → bundled wins.
 	const emptyHome = mkdtempSync(join(tmpdir(), "recheck-emptyhome-"));
 	const cwd = makeProject();
-	withHome(emptyHome, () => {
+	await withHome(emptyHome, () => {
 		const { pi, handlers } = makePi();
 		hukiHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
@@ -307,13 +331,13 @@ test("bundled used as fallback", () => {
 	});
 });
 
-test("PI_RECHECK_ASSETS_DIR takes priority over project and global", () => {
+test("PI_RECHECK_ASSETS_DIR takes priority over project and global", async () => {
 	clearEnv();
 	const home = makeGlobalAssets({ "recheck.md": "GLOBAL RECHECK", "anchor.md": "GLOBAL ANCHOR" });
 	const cwd = makeProject({ projectAssets: { "recheck.md": "PROJECT RECHECK" } });
 	const envDir = makeDirAssets({ "recheck.md": "ENV RECHECK", "anchor.md": "ENV ANCHOR" });
 	process.env.PI_RECHECK_ASSETS_DIR = envDir;
-	withHome(home, () => {
+	await withHome(home, () => {
 		const { pi, handlers } = makePi();
 		hukiHooks(pi);
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
@@ -321,36 +345,38 @@ test("PI_RECHECK_ASSETS_DIR takes priority over project and global", () => {
 	});
 });
 
-test("missing file stays silent", () => {
+test("missing file stays silent", async () => {
 	clearEnv();
 	// Copy the extension to a temp package whose bundled assets/ is EMPTY and
 	// whose project/global dirs are empty, so no candidate holds recheck.md.
 	const root = makeTempCopy({}); // empty assets dir
 	const cwd = makeProject();
 	const emptyHome = mkdtempSync(join(tmpdir(), "recheck-home-empty-"));
-	withHome(emptyHome, () => {
-		// Load the copied module so its import.meta.dirname points into root.
-		return import(join(root, "pi-extension", "index.ts")).then(({ default: copyHooks }) => {
+	try {
+		await withHome(emptyHome, async () => {
+			// Load the copied module so its import.meta.dirname points into root.
+			const { default: copyHooks } = await import(join(root, "pi-extension", "index.ts"));
 			const { pi, handlers, sent } = makePi();
 			copyHooks(pi);
 			const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 			assert.ok(!res || !res.entries, "recheck must stay silent when file missing");
 			handlers.session_compact(compactEvent(), { cwd });
 			assert.equal(sent.length, 0, "anchor must stay silent when file missing");
-			rmSync(root, { recursive: true, force: true });
 		});
-	});
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 // Guard: sanity that none of the temp dirs accidentally exist as real
 // task-file roots that would flip a "skip" assertion.
-test("homedir override reaches the global candidate", () => {
+test("homedir override reaches the global candidate", async () => {
 	clearEnv();
 	const realHome = homedir();
 	const home = makeGlobalAssets({ "recheck.md": "GLOBAL ONLY" });
 	// With the override active, resolveAssets should pick GLOBAL ONLY.
 	const cwd = makeProject();
-	withHome(home, () => {
+	await withHome(home, () => {
 		assert.notEqual(homedir(), realHome);
 		const { pi, handlers } = makePi();
 		hukiHooks(pi);
