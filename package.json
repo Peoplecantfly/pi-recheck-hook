@@ -1,0 +1,25 @@
+{
+  "name": "pi-recheck-hook",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Huki hooks for pi: end-of-turn recheck + post-compaction anchor.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "huki",
+    "recheck",
+    "anchor"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-extension/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5"
+  }
+}
