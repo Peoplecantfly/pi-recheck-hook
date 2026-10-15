@@ -271,7 +271,11 @@ export default function recheckHooks(pi: ExtensionAPI): void {
 		if (anchoredCompactions.has(key)) return; // once per compaction
 		anchoredCompactions.add(key);
 
-		// No triggerTurn: the message stays in the history but asks for no reply.
+		// triggerTurn: false keeps this a history-only append. With {} (triggerTurn
+		// undefined) pi would, while streaming, steer the message and elicit a model
+		// reply (sendCustomMessage: isStreaming && triggerTurn !== false -> steer).
+		// Auto-compaction (threshold/overflow) fires mid-run, i.e. streaming, so we
+		// must pin triggerTurn: false to get "no reply" in both idle and streaming.
 		pi.sendMessage(
 			{
 				customType: "pi-recheck:anchor",
@@ -279,7 +283,7 @@ export default function recheckHooks(pi: ExtensionAPI): void {
 				display: true,
 				details: { hook: "anchor", compactionId: key },
 			},
-			{},
+			{ triggerTurn: false },
 		);
 	});
 }

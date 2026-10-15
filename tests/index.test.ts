@@ -30,6 +30,7 @@ const bundledAnchor = () => readFileSync(ANCHOR_BUNDLED, "utf8");
 
 // ---- Harness: a fake ExtensionAPI that records handlers + sendMessage. ----
 
+/** @returns {{ handlers: Record<string, Function>, sent: Array<{message: any, options: any}>, pi: { on(event: string, handler: Function): () => void; sendMessage(message: any, options?: any): void } }} */
 function makePi() {
 	/** @type {Record<string, Function>} */
 	const handlers = {};
@@ -234,8 +235,9 @@ test("anchor injected after compaction, no continuation", () => {
 	assert.equal(sent.length, 1);
 	assert.equal(sent[0].message.customType, "pi-recheck:anchor");
 	assert.equal(sent[0].message.content[0].text, bundledAnchor());
-	// empty options => no triggerTurn
-	assert.notEqual(sent[0].options?.triggerTurn, true);
+	// triggerTurn must be pinned to false: with {} (undefined) pi would steer the
+	// message while streaming (auto-compaction) and elicit a model reply.
+	assert.equal(sent[0].options?.triggerTurn, false);
 });
 
 test("anchor once per compaction (same id twice)", () => {
@@ -383,4 +385,87 @@ test("homedir override reaches the global candidate", async () => {
 		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
 		assert.equal(res.entries[0].content[0].text, "GLOBAL ONLY");
 	});
+});
+
+// ===================== Pinned pi 1.2.0 contract (re-verify on pi bump) =====================
+//
+// These are the exact names and shapes the extension relies on, verified against
+// the installed pi 1.2.0 (core/extensions/types.d.ts):
+//   ExtensionAPI.on("agent_before_settle", ExtensionHandler<AgentBeforeSettleEvent, AgentBeforeSettleEventResult>)
+//   ExtensionAPI.on("session_compact",     ExtensionHandler<SessionCompactEvent>)
+//   AgentBeforeSettleEvent extends BoundaryState { entries, continue, context, outcome }
+//   AgentBeforeSettleEventResult = { entries?: SessionBoundaryDraft[]; continue?: boolean }
+//   SessionBoundaryDraft ⊇ CustomMessageEntryDraft { type:"custom_message", customType, content, display, details? }
+//   SessionCompactEvent { compactionEntry, fromExtension, reason, willRetry }
+//   sendMessage(msg: { customType, content, display, details? }, { triggerTurn?, deliverAs? })
+//   ExtensionHandler = (event, ctx: { cwd, ... }) => R | void
+// If pi renames any of these, this test (and the extension) must be updated together.
+
+const PI_SETTLE_EVENT = "agent_before_settle";
+const PI_COMPACT_EVENT = "session_compact";
+
+// A synthesized settle event carrying exactly the fields the extension reads from
+// the pi 1.2.0 event. Pin the field names so a pi rename is caught here.
+function contractSettleEvent() {
+	return {
+		type: PI_SETTLE_EVENT,        // pi: "agent_before_settle"
+		continue: false,              // pi: BoundaryState.continue
+		outcome: "completed",         // pi: AgentActivityOutcome
+		context: {                    // pi: BoundaryContextPreview
+			contextEntries: [          // pi: ProjectedSessionEntry[]
+				{ sourceEntry: { id: "e1", type: "message" },   // pi: SessionEntry { id, type }
+				  messages: [                                  // pi: AgentMessage[]
+				    { role: "user", content: [{ type: "text", text: "q" }] },
+				    { role: "assistant", content: [{ type: "text", text: "a" }] },
+				  ] },
+			],
+			contextMessages: [{ role: "user", content: [{ type: "text", text: "q" }] }], // pi: AgentMessage[]
+			canContinue: false,        // pi: BoundaryContextPreview.canContinue
+		},
+	};
+}
+
+test("contract: factory registers exactly the two pi event names", () => {
+	clearEnv();
+	const { pi, handlers } = makePi();
+	recheckHooks(pi);
+	const registered = Object.keys(handlers).sort();
+	assert.deepEqual(registered, [PI_COMPACT_EVENT, PI_SETTLE_EVENT].sort());
+});
+
+test("contract: recheck result matches AgentBeforeSettleEventResult / CustomMessageEntryDraft", () => {
+	clearEnv();
+	const cwd = makeProject();
+	const { pi, handlers } = makePi();
+	recheckHooks(pi);
+	const res = handlers[PI_SETTLE_EVENT](contractSettleEvent(), { cwd });
+	// AgentBeforeSettleEventResult = { entries?: SessionBoundaryDraft[]; continue?: boolean }
+	assert.equal(typeof res.continue, "boolean");
+	assert.ok(Array.isArray(res.entries));
+	for (const draft of res.entries) {
+		// CustomMessageEntryDraft { type:"custom_message", customType, content, display, details? }
+		assert.equal(draft.type, "custom_message");
+		assert.equal(typeof draft.customType, "string");
+		assert.ok(Array.isArray(draft.content) || typeof draft.content === "string");
+		assert.equal(typeof draft.display, "boolean");
+	}
+});
+
+test("contract: anchor sendMessage message matches Pick<CustomMessage,...> + triggerTurn pinned", () => {
+	clearEnv();
+	const cwd = makeProject();
+	const { pi, handlers, sent } = makePi();
+	recheckHooks(pi);
+	handlers[PI_COMPACT_EVENT](
+		{ type: PI_COMPACT_EVENT, compactionEntry: { id: "c1" }, fromExtension: false, reason: "manual", willRetry: false },
+		{ cwd },
+	);
+	assert.equal(sent.length, 1);
+	const msg = sent[0].message;
+	// sendMessage message: { customType, content, display, details? }
+	assert.equal(typeof msg.customType, "string");
+	assert.ok(Array.isArray(msg.content));
+	assert.equal(typeof msg.display, "boolean");
+	// options: { triggerTurn? } — must be explicitly false (history-only append)
+	assert.equal(sent[0].options?.triggerTurn, false);
 });
