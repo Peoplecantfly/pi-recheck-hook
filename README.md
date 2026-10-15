@@ -39,9 +39,11 @@ requesting a reply (`sendMessage` with no `triggerTurn`), so work continues from
 > (`session_compact`) — which is what the requirement actually asks for: keep the pointer to the
 > files, don't trust the summary.
 
-Subagent detection also differs: OpenCode used `session.parentID`; pi has no such link, so child
-sessions are detected from the `PI_SUBAGENT_SESSION` / `PI_SUBAGENT_ID` / `PI_SUBAGENT_NAME` /
-`PI_SUBAGENT_AGENT` environment variables (any one set ⇒ subagent).
+Subagent detection also differs: OpenCode used `session.parentID`; pi events carry no such link, so two
+markers are checked — (1) the session header's `parentSession` field (in-process child sessions, e.g.
+`@tintinweb/pi-subagents`, via `ctx.sessionManager.getHeader()`) and (2) the `PI_SUBAGENT_SESSION` /
+`PI_SUBAGENT_ID` / `PI_SUBAGENT_NAME` / `PI_SUBAGENT_AGENT` environment variables (process-spawned
+children, e.g. `pi-interactive-subagents`). Either present ⇒ subagent.
 
 ## Layout
 
@@ -70,7 +72,7 @@ declared in `package.json` under `pi.extensions`. Prompt text is resolved at run
 | --- | --- |
 | `PI_RECHECK` | Set to `0` to disable the recheck hook. |
 | `PI_RECHECK_ASSETS_DIR` | Extra top-priority assets dir. |
-| `PI_SUBAGENT_*` | Presence of any of the four markers ⇒ treated as a subagent; both hooks stay silent. |
+| Subagent markers | Session header carrying `parentSession` (in-process child session), or any of the four `PI_SUBAGENT_*` env vars ⇒ treated as a subagent; both hooks stay silent. |
 
 Assets are resolved per **file**, first hit wins:
 

@@ -267,6 +267,32 @@ test("subagent sessions ignored (any PI_SUBAGENT_* set)", () => {
 	}
 });
 
+test("in-process child sessions ignored (parentSession in header)", () => {
+	clearEnv();
+	const cwd = makeProject();
+	const childCtx = {
+		cwd,
+		sessionManager: { getHeader: () => ({ type: "session", id: "child", parentSession: "/sessions/parent.jsonl" }) },
+	};
+	const { pi, handlers, sent } = makePi();
+	recheckHooks(pi);
+	const res = handlers.agent_before_settle(assistantSettle("child-1"), childCtx);
+	assert.ok(!res || !res.entries, "recheck must skip child sessions");
+	handlers.session_compact(compactEvent("child-1"), childCtx);
+	assert.equal(sent.length, 0, "anchor must skip child sessions");
+});
+
+test("main session without parentSession header still fires", () => {
+	clearEnv();
+	const cwd = makeProject();
+	const mainCtx = { cwd, sessionManager: { getHeader: () => ({ type: "session", id: "main" }) } };
+	const { pi, handlers } = makePi();
+	recheckHooks(pi);
+	const res = handlers.agent_before_settle(assistantSettle("main-1"), mainCtx);
+	assert.ok(res, "handler returned nothing");
+	assert.equal(res.entries[0].customType, "pi-recheck:recheck");
+});
+
 test("foreign repository ignored (no task files)", () => {
 	clearEnv();
 	const cwd = makeProject({ taskFile: false });

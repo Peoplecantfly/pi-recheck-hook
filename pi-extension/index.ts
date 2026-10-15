@@ -19,10 +19,13 @@
 //      into the history right AFTER compaction (`session_compact`), which is
 //      what the anchor requirement actually calls for: keep the message,
 //      don't trust the summary.
-//   · OpenCode detected subagents via `session.parentID`. Pi has no such
-//      link; child sessions launch with PI_SUBAGENT_SESSION / PI_SUBAGENT_ID /
-//      PI_SUBAGENT_NAME / PI_SUBAGENT_AGENT env vars
-//      (pi-interactive-subagents, pi-extension/subagents/index.ts:1556-1582).
+//   · OpenCode detected subagents via `session.parentID`. Pi in-process child
+//      sessions (e.g. @tintinweb/pi-subagents) run in the same process — no
+//      env vars — but their session header carries `parentSession`, readable
+//      via `ctx.sessionManager.getHeader()`. Process-spawned children
+//      (pi-interactive-subagents) launch with PI_SUBAGENT_SESSION /
+//      PI_SUBAGENT_ID / PI_SUBAGENT_NAME / PI_SUBAGENT_AGENT env vars
+//      (pi-extension/subagents/index.ts:1556-1582).
 //   · "Turn ended, waiting for a human" = the single boundary event
 //      `agent_before_settle` (not `turn_end`: it fires per turn inside a run;
 //      not `agent_settled`: notification-only). At that point
@@ -136,7 +139,11 @@ type BoundaryDraft = {
 	details?: Record<string, unknown>;
 };
 type SettleResult = { entries?: BoundaryDraft[]; continue?: boolean };
-type ExtensionCtx = { cwd: string };
+type SessionHeaderLike = { parentSession?: string };
+type ExtensionCtx = {
+	cwd: string;
+	sessionManager?: { getHeader?(): SessionHeaderLike | null };
+};
 type SendMessageOptions = { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" };
 type ExtensionAPI = {
 	on(event: "agent_before_settle", handler: (event: AnySettleEvent, ctx: ExtensionCtx) => SettleResult | void): () => void;
@@ -159,11 +166,16 @@ function textOf(content: string | TextPart[] | undefined): string {
 }
 
 /**
- * Are we in a subagent? Pi child sessions always have PI_SUBAGENT_SESSION;
- * the softer markers (PI_SUBAGENT_ID/NAME/AGENT) count too — if any is set,
- * this is not the main session.
+ * Are we in a subagent? Two detection paths, either one suffices:
+ *   · In-process child sessions (e.g. the @tintinweb/pi-subagents Agent tool)
+ *     run in this very process, so no env vars are set — but their session
+ *     header carries `parentSession`. That is the marker we check first.
+ *   · Process-spawned children (pi-interactive-subagents) launch with
+ *     PI_SUBAGENT_SESSION; the softer markers (PI_SUBAGENT_ID/NAME/AGENT)
+ *     count too — if any is set, this is not the main session.
  */
-function isSubagent(): boolean {
+function isSubagent(ctx: ExtensionCtx): boolean {
+	if (ctx.sessionManager?.getHeader?.()?.parentSession) return true;
 	return Boolean(
 		process.env.PI_SUBAGENT_SESSION ||
 			process.env.PI_SUBAGENT_ID ||
@@ -221,7 +233,7 @@ export default function recheckHooks(pi: ExtensionAPI): void {
 		if (process.env.PI_RECHECK === "0") return; // disabled
 		if (!recheck) return; // prompt file missing — stay silent
 		if (!hasTaskFiles(ctx.cwd)) return; // foreign repository
-		if (isSubagent()) return; // main session only
+		if (isSubagent(ctx)) return; // main session only
 		if (event.outcome !== "completed") return; // error/abort is not our case
 
 		const last = lastEntryWithMessages(event.context.contextEntries);
@@ -266,7 +278,7 @@ export default function recheckHooks(pi: ExtensionAPI): void {
 		const { anchor } = resolveAssets(ctx.cwd);
 		if (!anchor) return; // prompt file missing — stay silent
 		if (!hasTaskFiles(ctx.cwd)) return; // foreign repository
-		if (isSubagent()) return; // main session only
+		if (isSubagent(ctx)) return; // main session only
 		const key = event.compactionEntry?.id ?? event.reason;
 		if (anchoredCompactions.has(key)) return; // once per compaction
 		anchoredCompactions.add(key);
