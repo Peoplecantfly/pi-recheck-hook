@@ -49,7 +49,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const CONFIG_DIR = join(".pi", "pi-recheck-hook");
 const GLOBAL_STATE_DIR = join(".pi", "agent", "extension-data", "pi-recheck-hook");

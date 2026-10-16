@@ -387,19 +387,28 @@ test("same entry id twice fires both times — ids do not dedupe, the pending ch
 	assert.ok(second && second.entries, "no entry-id memory — the self-brake is the pending check");
 });
 
-test("entries with empty messages arrays are skipped, not trusted", () => {
+test("empty-message entries do not fake a pending check, nor a real one", () => {
 	clearEnv();
 	const cwd = enabledProject();
 	const { handlers } = setup();
-	// Real shapes: plain custom entries and context edits project to NO
-	// messages (session-manager.js sessionEntryToContextMessages).
-	const ev = settleWith([
+	// Real shape: an older retained compaction projects to NO messages
+	// (session-manager.js sessionEntryToContextMessages), so the last entry can
+	// carry no messages at all — nothing to trust, stay silent.
+	const noMessagesLast = settleWith([
+		msgEntry("e1", { role: "user", content: [{ type: "text", text: "do the thing" }] }),
+		{ sourceEntry: { id: "e2", type: "message" }, messages: [] },
+	]);
+	const resLast = handlers.agent_before_settle(noMessagesLast, { cwd });
+	assert.ok(!resLast || !resLast.entries, "last entry with no messages must stay silent");
+
+	// An empty entry in the middle must not read as "check already pending".
+	const emptyInMiddle = settleWith([
 		msgEntry("e1", { role: "user", content: [{ type: "text", text: "do the thing" }] }),
 		{ sourceEntry: { id: "c9", type: "custom", customType: "pi-recheck:recheck" }, messages: [] },
 		msgEntry("e2", { role: "assistant", content: [{ type: "text", text: "I claim done" }] }),
 	]);
-	const res = handlers.agent_before_settle(ev, { cwd });
-	assert.ok(res && res.entries, "an entry with no messages cannot be a pending check");
+	const resMiddle = handlers.agent_before_settle(emptyInMiddle, { cwd });
+	assert.ok(resMiddle && resMiddle.entries, "an entry with no messages cannot be a pending check");
 });
 
 test("recheck skipped after compaction/branch_summary entry", () => {
@@ -655,10 +664,10 @@ test("/recheck with a broken settings dir must not throw", async () => {
 	await commands.recheck.handler("on", ctx);
 });
 
-// ===================== Pinned pi 1.2.0 contract (re-verify on pi bump) =====================
+// ===================== Pinned pi 1.3.0 contract (re-verify on pi bump) =====================
 //
 // These are the exact names and shapes the extension relies on, verified against
-// the installed pi 1.2.0 (core/extensions/types.d.ts):
+// the installed pi 1.3.0 (core/extensions/types.d.ts):
 //   ExtensionAPI.on("agent_before_settle", ExtensionHandler<AgentBeforeSettleEvent, AgentBeforeSettleEventResult>)
 //   ExtensionAPI.on("session_compact",     ExtensionHandler<SessionCompactEvent>)
 //   AgentBeforeSettleEvent extends BoundaryState { entries, continue, context, outcome }
@@ -673,7 +682,7 @@ const PI_SETTLE_EVENT = "agent_before_settle";
 const PI_COMPACT_EVENT = "session_compact";
 
 // A synthesized settle event carrying exactly the fields the extension reads from
-// the pi 1.2.0 event. Pin the field names so a pi rename is caught here.
+// the pi 1.3.0 event. Pin the field names so a pi rename is caught here.
 function contractSettleEvent() {
 	return {
 		type: PI_SETTLE_EVENT,        // pi: "agent_before_settle"
