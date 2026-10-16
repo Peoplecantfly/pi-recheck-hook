@@ -3,7 +3,7 @@
 Two behavioural hooks for [pi](https://github.com/badlogic/pi-mono), ported from the workshop
 OpenCode plugin "Huki". They fight two failure modes: an agent that ends a turn having answered
 from memory instead of from the code, and an agent that keeps working from a compaction summary
-instead of from the task files.
+instead of from its session state file.
 
 Private, dependency-free pi extension package — `"private": true`, no runtime dependencies
 (only `@types/node` as a devDependency), nothing compiled or published.
@@ -21,16 +21,22 @@ Fires at the `agent_before_settle` boundary — the final actionable event, the 
 still append an entry and ask for another model request. `turn_end` fires per turn inside a run and
 `agent_settled` is notification-only, so neither is used.
 
-Suppressed when: `PI_RECHECK=0`; the prompt file is missing; the cwd has no task files; this is a
-subagent session; the outcome was `aborted` or `error`; the last entry is a `compaction` or
-`branch_summary`; the turn did not end with an assistant message; the prompt was already the last
-human text; or it already fired for this turn.
+Suppressed when: `PI_RECHECK` is `0`/`false`/`off`; the hook is not enabled (see Scope — default
+is OFF); this is a subagent session or an in-process child session; no non-blank prompt file
+exists in the asset chain; the last entry is a `compaction` or `branch_summary`; the outcome was
+`aborted` or `error`; the turn did not end with an assistant message that claimed something (text
+or toolCall); or our own `recheck.md` is already the latest non-model message in the context
+(`customType: "pi-recheck:recheck"`) — pi 1.3.0 has no auto-turn cap, so that pending-check guard
+is what keeps the hook from re-injecting forever. There is no `[Recheck]` text to match against.
 
 ### 2. Post-compaction anchor
 
 After compaction, the anchor text from `assets/anchor.md` is injected into the history without
-requesting a reply (`sendMessage` with no `triggerTurn`), so work continues from
-`tasks/factory/00-obshchee.md` / `state.md` / the current task file rather than from the summary.
+requesting a reply (`sendMessage` with `triggerTurn: false`), so work continues from this session's
+state file `.pi/pi-recheck-hook/<session id>/state.md` (the concrete id is substituted into the
+prompt at injection time when pi exposes `sessionManager.getSessionId()`) and, when present, the
+project rules file `.pi/pi-recheck-hook/common.md`, rather than from the summary; without them,
+from freshly verified code and commands.
 
 > **Deviation from the OpenCode original.** OpenCode had `experimental.session.compacting`, which
 > could carry the anchor *into* the summary. In pi, `session_before_compact` does not hook into the
@@ -70,7 +76,8 @@ declared in `package.json` under `pi.extensions`. Prompt text is resolved at run
 
 | Variable | Effect |
 | --- | --- |
-| `PI_RECHECK` | Set to `0` to disable the recheck hook. |
+| `PI_RECHECK` | Kill/force switch: `0`/`false`/`off` forces the hooks off, `1`/`true`/`on` forces them on; anything else defers to settings. |
+| `settings.json` | `{ "enabled": true|false }` in `<cwd>/.pi/pi-recheck-hook/` or `~/.pi/agent/extension-data/pi-recheck-hook/`. A file that is missing, unparseable, or without a boolean `enabled` counts as absent. Also manageable via `/recheck on|off`. |
 | `PI_RECHECK_ASSETS_DIR` | Extra top-priority assets dir. |
 | Subagent markers | Session header carrying `parentSession` (in-process child session), or any of the four `PI_SUBAGENT_*` env vars ⇒ treated as a subagent; both hooks stay silent. |
 
@@ -82,15 +89,18 @@ Assets are resolved per **file**, first hit wins:
 4. `<module>/../assets` — bundled
 
 An unreadable file counts as missing and the chain continues; if nothing matches, the handler
-stays silent. Resolved prompts are cached per cwd, so editing an asset mid-session has no effect
-until restart.
+stays silent. Prompts are re-read from disk on every hook event — no cache — so editing an asset
+takes effect on the next event.
 
 ## Scope
 
-Both hooks no-op unless the cwd contains `tasks/factory/00-obshchee.md` or
-`workshop/tasks/factory/00-obshchee.md`. Running pi from a checkout of this repository does
-nothing — that is expected; the task files live in the project you work on, not here. To use the
-hooks elsewhere with different task-file paths, add them to `TASK_FILE_PATHS`.
+Enablement is config-driven, default **OFF**: `$PI_RECHECK` → project `settings.json` → global
+`settings.json` → nothing means disabled. Both hooks inject nothing until one of those switches
+says on. The old task-file gate was removed in the 2026-10-16 rework; task paths are gone from
+code and prompts alike. State is per pi session: `.pi/pi-recheck-hook/<session id>/state.md`,
+injected with the concrete session id when pi exposes it; project rules live in
+`.pi/pi-recheck-hook/common.md` (the model is told to re-read it at every anchor). Both are
+optional and named in prompt text only — the hook never reads or writes either.
 
 ## Test
 

@@ -1,301 +1,298 @@
-// © {proj:"ai_kit", path:"pi-recheck-hook/pi-extension/index.ts", kind:"code", created:"2026-10-14", note:"Recheck + anchor hooks for pi: end-of-turn recheck + post-compaction anchor. Port of the workshop OpenCode plugin. Prompt texts live in ../assets/."}
-//
-// Recheck + anchor hooks for pi (port of the OpenCode plugin).
-//
-// The spec lives in the workshop markdown file beside that plugin; this file
-// only implements it.
-//   1. Recheck: the agent finished a turn and waits for a human → send the
-//      "verify against facts, not from memory" prompt. Once per turn.
-//      Not in subagents, not right after a summary, not after an error.
-//      Disabled with PI_RECHECK=0.
-//   2. Anchor: after compaction inject a message without a model reply so
-//      work continues from the task files, not from the summary.
-//
-// What is not ported literally (pi API constraints):
-//   · OpenCode had `experimental.session.compacting` — we asked to carry the
-//      anchor into the summary. In pi `session_before_compact` does not hook
-//      into the compaction protocol and handler-returned `customInstructions`
-//      are ignored (agent-session.js:2257). Instead the anchor is injected
-//      into the history right AFTER compaction (`session_compact`), which is
-//      what the anchor requirement actually calls for: keep the message,
-//      don't trust the summary.
-//   · OpenCode detected subagents via `session.parentID`. Pi in-process child
-//      sessions (e.g. @tintinweb/pi-subagents) run in the same process — no
-//      env vars — but their session header carries `parentSession`, readable
-//      via `ctx.sessionManager.getHeader()`. Process-spawned children
-//      (pi-interactive-subagents) launch with PI_SUBAGENT_SESSION /
-//      PI_SUBAGENT_ID / PI_SUBAGENT_NAME / PI_SUBAGENT_AGENT env vars
-//      (pi-extension/subagents/index.ts:1556-1582).
-//   · "Turn ended, waiting for a human" = the single boundary event
-//      `agent_before_settle` (not `turn_end`: it fires per turn inside a run;
-//      not `agent_settled`: notification-only). At that point
-//      `context.canContinue` is always false (last fragment is the assistant
-//      reply); we still request continuation because we expect an answer.
-//
-// Asset resolution is lazy and per-cwd (see resolveAssets): the running cwd
-// is not known at module-load time, so prompts are resolved from ctx.cwd
-// inside the handlers, with a small per-directory cache.
-
-/// <reference types="node" />
-
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-
-// ==================== CONFIG ====================
-
 /**
- * Prompt texts are not pinned in code — `assets/recheck.md` and
- * `assets/anchor.md` hold them (English rendering of the two blocks in the
- * workshop spec file; the originals there are Russian).
+ * pi-recheck-hook — every "done" is unverified until a checker says so.
  *
- * Resolution chain, checked per asset; first location that contains the file
- * wins, none → empty string → the handler stays silent:
- *   0. `PI_RECHECK_ASSETS_DIR` (if set) — extra top-priority dir.
- *   1. `<cwd>/.pi/pi-recheck-hook/assets` — project-local override.
- *   2. `~/.pi/agent/extension-data/pi-recheck-hook/assets` — global.
- *   3. `<module>/../assets` — bundled (sibling of this extension dir).
+ * Two hooks:
+ *
+ *  1. `agent_before_settle` — fires at every settle boundary, and pi
+ *     repeats the boundary after EACH auto-turn (_runBeforeSettleBoundary,
+ *     agent-session.js:1538). pi 1.3.0 has no auto-turn cap, so the loop
+ *     brake is ours: hasPendingRecheckCheck() below stays silent while the
+ *     latest non-model context message is our own recheck prompt
+ *     (customType `pi-recheck:recheck`). The anchor never counts as a
+ *     pending check. Drafts are `CustomMessageEntryDraft`
+ *     (`type: "custom_message"`, `customType`, `content`, `display`);
+ *     customType is the marker.
+ *
+ *  2. `session_compact` — runs AFTER the compaction summary is appended.
+ *     In practice pi fires it once per compaction. We append the anchor
+ *     message through `pi.sendMessage(..., { triggerTurn: false })`: pinned
+ *     to false so pi never steers a model reply out of it (history-only).
+ *     Fires for manual and auto compaction alike.
+ *
+ * Enablement is config-driven, NOT task-file driven (2026-10-16 rework):
+ *   $PI_RECHECK kill switch ("0"/"false"/"off" force-off,
+ *                            "1"/"true"/"on" force-on)
+ *   → <cwd>/.pi/pi-recheck-hook/settings.json   (project)
+ *   → ~/.pi/agent/extension-data/pi-recheck-hook/settings.json (global)
+ *   → nothing → DISABLED. A settings file that is missing, unparseable, or
+ *   without a boolean "enabled" counts as absent; the chain continues.
+ *
+ * The task-file layout gate is gone (2026-10-16 rework) and no task paths
+ * remain in code or prompts. Session state lives in
+ * `.pi/pi-recheck-hook/<session id>/state.md`, project rules in
+ * `.pi/pi-recheck-hook/common.md` — the prompt text names them only; the
+ * hook never reads, writes or creates them, and both are optional. Before
+ * injection the `<session id>` marker in the prompt text is replaced with the
+ * real id from `ctx.sessionManager.getSessionId()` when pi exposes one.
+ *
+ * Asset chain per prompt file (first non-blank hit wins): $PI_RECHECK_ASSETS_DIR
+ * → <cwd>/.pi/pi-recheck-hook/assets → global extension-data assets → bundled
+ * assets beside this module. Missing, unreadable, or blank files continue the
+ * chain. No hit at all → the hook stays silent.
+ *
+ * Both hooks must never throw: a rejected hook or command aborts the settle /
+ * the session. All fs work is wrapped in try/catch.
+ *
+ * The prompt texts are English renderings of the Russian originals. If the
+ * originals are kept somewhere, keep them in sync with this file.
  */
-function candidateAssetDirs(cwd: string): string[] {
-	const dirs = [
-		join(cwd, ".pi", "pi-recheck-hook", "assets"),
-		join(homedir(), ".pi", "agent", "extension-data", "pi-recheck-hook", "assets"),
-		join(import.meta.dirname, "..", "assets"),
-	];
-	const envDir = process.env.PI_RECHECK_ASSETS_DIR;
-	return envDir ? [envDir, ...dirs] : dirs;
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+
+const CONFIG_DIR = join(".pi", "pi-recheck-hook");
+const GLOBAL_STATE_DIR = join(".pi", "agent", "extension-data", "pi-recheck-hook");
+const GLOBAL_ASSETS_DIR = join(GLOBAL_STATE_DIR, "assets");
+
+function homeDir(): string | undefined {
+	const home = process.env.HOME ?? process.env.USERPROFILE;
+	return home && home !== "" ? home : undefined;
 }
 
-type Prompts = { recheck: string; anchor: string };
-
-/** Cache keyed by cwd so a repeated handler call does not re-read the chain. */
-const promptsByCwd = new Map<string, Prompts>();
-
-/**
- * Resolve both prompts for `cwd`, walking the chain per file. A file that is
- * unreadable counts as missing (empty); the first location that holds a
- * readable copy wins.
- */
-function resolveAssets(cwd: string): Prompts {
-	const cached = promptsByCwd.get(cwd);
-	if (cached) return cached;
-
-	const dirs = candidateAssetDirs(cwd);
-	const firstExisting = (asset: "recheck.md" | "anchor.md"): string => {
-		for (const dir of dirs) {
-			const file = join(dir, asset);
-			if (!existsSync(file)) continue;
-			try {
-				return readFileSync(file, "utf8");
-			} catch {
-				// Unreadable — treat as missing and keep walking the chain.
-			}
-		}
-		return "";
-	};
-
-	const prompts: Prompts = {
-		recheck: firstExisting("recheck.md"),
-		anchor: firstExisting("anchor.md"),
-	};
-	promptsByCwd.set(cwd, prompts);
-	return prompts;
-}
-
-/** Candidate paths to the "common file" — repo root or workshop/ as root. */
-const TASK_FILE_PATHS: string[][] = [
-	["tasks", "factory", "00-obshchee.md"],
-	["workshop", "tasks", "factory", "00-obshchee.md"],
-];
-
-// ==================== TYPES (minimal, so the file has no package deps) ====================
-
-type TextPart = { type: string; text?: string };
-type AnyMessage = { role: string; content: TextPart[] };
-type AnyEntry = { sourceEntry: { id: string; type: string }; messages: AnyMessage[] };
-type AnyContext = {
-	contextEntries: AnyEntry[];
-	contextMessages: AnyMessage[];
-	canContinue: boolean;
-};
-type AnySettleEvent = {
-	type: "agent_before_settle";
-	continue: boolean;
-	context: AnyContext;
-	outcome: "completed" | "aborted" | "error";
-};
-type AnyCompactEvent = {
-	type: "session_compact";
-	compactionEntry?: { id: string };
-	fromExtension: boolean;
-	reason: "manual" | "threshold" | "overflow";
-	willRetry: boolean;
-};
-type BoundaryDraft = {
-	type: "custom_message";
-	customType: string;
-	content: TextPart[];
-	display: boolean;
-	details?: Record<string, unknown>;
-};
-type SettleResult = { entries?: BoundaryDraft[]; continue?: boolean };
-type SessionHeaderLike = { parentSession?: string };
-type ExtensionCtx = {
-	cwd: string;
-	sessionManager?: { getHeader?(): SessionHeaderLike | null };
-};
-type SendMessageOptions = { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" };
-type ExtensionAPI = {
-	on(event: "agent_before_settle", handler: (event: AnySettleEvent, ctx: ExtensionCtx) => SettleResult | void): () => void;
-	on(event: "session_compact", handler: (event: AnyCompactEvent, ctx: ExtensionCtx) => void): () => void;
-	sendMessage(
-		message: { customType: string; content: TextPart[]; display: boolean; details?: Record<string, unknown> },
-		options?: SendMessageOptions,
-	): void;
-};
-
-// ==================== HELPERS ====================
-
-/**
- * Message text: `content` is a fragment array that may contain non-text
- * parts (images), so only text fragments are joined.
- */
-function textOf(content: string | TextPart[] | undefined): string {
-	if (typeof content === "string") return content;
-	return (content ?? []).map((part) => part.text ?? "").join("\n");
-}
-
-/**
- * Are we in a subagent? Two detection paths, either one suffices:
- *   · In-process child sessions (e.g. the @tintinweb/pi-subagents Agent tool)
- *     run in this very process, so no env vars are set — but their session
- *     header carries `parentSession`. That is the marker we check first.
- *   · Process-spawned children (pi-interactive-subagents) launch with
- *     PI_SUBAGENT_SESSION; the softer markers (PI_SUBAGENT_ID/NAME/AGENT)
- *     count too — if any is set, this is not the main session.
- */
-function isSubagent(ctx: ExtensionCtx): boolean {
-	if (ctx.sessionManager?.getHeader?.()?.parentSession) return true;
-	return Boolean(
-		process.env.PI_SUBAGENT_SESSION ||
-			process.env.PI_SUBAGENT_ID ||
-			process.env.PI_SUBAGENT_NAME ||
-			process.env.PI_SUBAGENT_AGENT,
-	);
-}
-
-/**
- * Has this text already been said? Exact match only — our own message stays
- * in the history verbatim, so a paraphrase or a partial quote does not
- * count as "the human already asked this".
- */
-function alreadyAsked(text: string | undefined, prompt: string): boolean {
-	return text === prompt;
-}
-
-/**
- * Does this folder hold the task workspace: `tasks/factory/00-obshchee.md`
- * (as in the original) or `workshop/tasks/factory/00-obshchee.md`
- * (layout of this repository)?
- */
-function hasTaskFiles(cwd: string): boolean {
-	return TASK_FILE_PATHS.some((path) => existsSync(join(cwd, ...path)));
-}
-
-/**
- * Last fragment that still speaks for a "human" (user, or our own
- * custom_message). Scanned from the end — `lastHumanText` in the original.
- */
-function lastHumanText(messages: AnyMessage[]): string | undefined {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message.role === "user" || message.role === "custom") return textOf(message.content);
+/** Read `{ "enabled": boolean }`; anything else (bad JSON, wrong type) is absent. */
+function readEnabledFlag(path: string): boolean | null {
+	try {
+		if (!existsSync(path)) return null;
+		const data = JSON.parse(readFileSync(path, "utf8"));
+		if (typeof data !== "object" || data === null) return null;
+		const flag = (data as Record<string, unknown>).enabled;
+		return typeof flag === "boolean" ? flag : null;
+	} catch {
+		return null;
 	}
-	return undefined;
 }
 
-/** Last entry carrying messages (searched from the end). */
-function lastEntryWithMessages(entries: AnyEntry[]): AnyEntry | undefined {
+function isEnabled(cwd: string): boolean {
+	// Kill/force switch, readable without a running pi session.
+	const env = process.env.PI_RECHECK?.trim().toLowerCase();
+	if (env === "0" || env === "false" || env === "off") return false;
+	if (env === "1" || env === "true" || env === "on") return true;
+
+	const project = readEnabledFlag(join(cwd, CONFIG_DIR, "settings.json"));
+	if (project !== null) return project;
+
+	const home = homeDir();
+	if (home) {
+		const global = readEnabledFlag(join(home, GLOBAL_STATE_DIR, "settings.json"));
+		if (global !== null) return global;
+	}
+	return false; // default: OFF — the hook only works when switched on
+}
+
+function assetsRoots(cwd: string): string[] {
+	const roots: string[] = [];
+	const envDir = process.env.PI_RECHECK_ASSETS_DIR?.trim();
+	if (envDir) roots.push(envDir);
+	roots.push(join(cwd, CONFIG_DIR, "assets"));
+	const home = homeDir();
+	if (home) roots.push(join(home, GLOBAL_ASSETS_DIR));
+	roots.push(resolve(import.meta.dirname, "..", "assets"));
+	return roots;
+}
+
+/** First readable, non-blank prompt file in the asset chain; "" when none
+ * exists. An empty or whitespace-only file counts as missing so a half-edited
+ * asset falls through to the next root instead of injecting blank text. */
+function loadPrompt(cwd: string, name: string): string {
+	for (const root of assetsRoots(cwd)) {
+		const path = join(root, name);
+		try {
+			if (!existsSync(path)) continue;
+			const text = readFileSync(path, "utf8");
+			if (text.trim() !== "") return text;
+		} catch {
+			// An unreadable file counts as missing — try the next root.
+		}
+	}
+	return "";
+}
+
+function isSubagentSession(env: NodeJS.ProcessEnv): boolean {
+	return Boolean(env.PI_SUBAGENT_SESSION || env.PI_SUBAGENT_ID || env.PI_SUBAGENT_NAME || env.PI_SUBAGENT_AGENT);
+}
+
+/** Child (in-process forked) sessions carry a parentSession in the header. */
+function isChildSession(ctx: ExtensionContext): boolean {
+	try {
+		const header = (ctx as any)?.sessionManager?.getHeader?.();
+		return Boolean(header?.parentSession);
+	} catch {
+		return false;
+	 }
+}
+
+// No entry/compaction-id memory: the projected context only grows, so ids
+// repeat within one replay only, where the pending-check guard answers.
+
+function isBoundaryCovered(entry: any): boolean {
+	// A compaction or branch_summary boundary is not "assistant just claimed
+	// something" — the recheck prompt belongs to a real done, not to these.
+	return entry?.sourceEntry?.type !== "message";
+}
+
+/** True while the latest non-model message in the projected context is our
+ * recheck prompt — a check is pending, so a new injection would only start
+ * another verify turn and another boundary (pi 1.3.0 caps nothing). The
+ * anchor does not count: it never substitutes for a per-turn recheck.
+ * Mirrors the real projection shape: one message per entry, custom entries
+ * project to a role-custom message carrying customType (messages.js:57). */
+function hasPendingRecheckCheck(entries: any[]): boolean {
 	for (let i = entries.length - 1; i >= 0; i--) {
-		if ((entries[i].messages?.length ?? 0) > 0) return entries[i];
+		const messages = entries[i]?.messages ?? [];
+		for (let j = messages.length - 1; j >= 0; j--) {
+			const message = messages[j];
+			const role = message?.role;
+			// Assistant turns and tool results are model-side chatter.
+			if (role === "assistant" || role === "toolResult") continue;
+			return role === "custom" && message?.customType === "pi-recheck:recheck";
+		}
 	}
-	return undefined;
+	return false;
 }
 
-// ==================== HOOK 1: RECHECK ====================
+/** Replace the literal `<session id>` marker with the concrete session id when
+ * pi exposes one (ReadonlySessionManager.getSessionId). Without an id the text
+ * stays byte-identical to the asset file. */
+function renderPrompt(text: string, ctx: ExtensionContext): string {
+	if (!text.includes("<session id>")) return text;
+	let sessionId: string | undefined;
+	try {
+		sessionId = (ctx as any)?.sessionManager?.getSessionId?.();
+	} catch {
+		sessionId = undefined; // a getter failure must never abort the hook
+	}
+	return sessionId ? text.replaceAll("<session id>", sessionId) : text;
+}
 
-export default function recheckHooks(pi: ExtensionAPI): void {
-	const recheckedEntries = new Set<string>();
-	const anchoredCompactions = new Set<string>();
+export default function (pi: ExtensionAPI) {
+	// /recheck [on|off|status] — manage the project-local setting.
+	pi.registerCommand("recheck", {
+		description: "pi-recheck-hook: show or change checker state",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const notify = (msg: string, level: "info" | "warning" | "error") => (ctx as any).ui?.notify?.(msg, level);
+			try {
+				const cwd = ctx.cwd;
+				const arg = (args ?? "").trim().toLowerCase();
 
-	pi.on("agent_before_settle", (event, ctx) => {
-		const { recheck, anchor } = resolveAssets(ctx.cwd);
-		if (process.env.PI_RECHECK === "0") return; // disabled
-		if (!recheck) return; // prompt file missing — stay silent
-		if (!hasTaskFiles(ctx.cwd)) return; // foreign repository
-		if (isSubagent(ctx)) return; // main session only
-		if (event.outcome !== "completed") return; // error/abort is not our case
-
-		const last = lastEntryWithMessages(event.context.contextEntries);
-		if (!last) return; // empty projection — nothing to continue from
-		if (last.sourceEntry.type === "compaction" || last.sourceEntry.type === "branch_summary") {
-			return; // right after a summary — not our case
-		}
-
-		const lastMessage = last.messages[last.messages.length - 1];
-		if (lastMessage?.role !== "assistant") return; // turn did not end with an answer
-
-		const key = last.sourceEntry.id;
-		if (recheckedEntries.has(key)) return; // already sent once for this turn
-
-		const humanText = lastHumanText(event.context.contextMessages);
-		// Never answer our own recheck or anchor a second time.
-		if (alreadyAsked(humanText, recheck) || alreadyAsked(humanText, anchor)) return;
-
-		// Note: do NOT check context.canContinue here. At "turn ended, waiting
-		// for a human" the last fragment is the assistant reply, so
-		// canContinue is always false; continuation works precisely because
-		// our recheck message becomes the last one.
-		recheckedEntries.add(key);
-		return {
-			entries: [
-				{
-					type: "custom_message",
-					customType: "pi-recheck:recheck",
-					content: [{ type: "text", text: recheck }],
-					display: true,
-					details: { hook: "recheck", entryId: key },
-				},
-			],
-			// Expect an answer, don't just drop text into the history.
-			continue: true,
-		};
+				if (arg === "on" || arg === "off") {
+					const enabled = arg === "on";
+					const path = join(cwd, CONFIG_DIR, "settings.json");
+					mkdirSync(dirname(path), { recursive: true });
+					writeFileSync(path, `${JSON.stringify({ enabled }, null, 2)}\n`);
+					notify(`pi-recheck-hook ${enabled ? "enabled" : "disabled"} — ${path}`, enabled ? "info" : "warning");
+				} else if (arg) {
+					notify("usage: /recheck [on|off]", "info");
+				} else {
+					const lines = [
+						`checker: ${isEnabled(cwd) ? "ON" : "OFF"} (default OFF; /recheck on to enable)`,
+						isSubagentSession(process.env)
+							? "subagent session detected (PI_SUBAGENT_*) — the hook never injects here"
+							: "not a subagent session (PI_SUBAGENT_* unset)",
+					];
+					notify(lines.join("\n"), "info");
+				}
+			} catch (error) {
+				try {
+					(ctx as any).ui?.notify?.(`pi-recheck-hook: ${error instanceof Error ? error.message : String(error)}`, "error");
+				} catch {
+					// UI unavailable — nothing safe left to do.
+				}
+			}
+		},
 	});
 
-	// ==================== HOOK 2: ANCHOR ====================
+	pi.on("agent_before_settle", (event: any, ctx: ExtensionContext) => {
+		try {
+			// Subagent sessions: no injection — not as worker, not as orchestrator.
+			if (isSubagentSession(process.env)) return;
+			if (isChildSession(ctx)) return;
+			if (!isEnabled(ctx.cwd)) return;
 
-	pi.on("session_compact", (event, ctx) => {
-		const { anchor } = resolveAssets(ctx.cwd);
-		if (!anchor) return; // prompt file missing — stay silent
-		if (!hasTaskFiles(ctx.cwd)) return; // foreign repository
-		if (isSubagent(ctx)) return; // main session only
-		const key = event.compactionEntry?.id ?? event.reason;
-		if (anchoredCompactions.has(key)) return; // once per compaction
-		anchoredCompactions.add(key);
+			const recheck = loadPrompt(ctx.cwd, "recheck.md");
+			if (!recheck) return; // no prompt file anywhere → stay silent
 
-		// triggerTurn: false keeps this a history-only append. With {} (triggerTurn
-		// undefined) pi would, while streaming, steer the message and elicit a model
-		// reply (sendCustomMessage: isStreaming && triggerTurn !== false -> steer).
-		// Auto-compaction (threshold/overflow) fires mid-run, i.e. streaming, so we
-		// must pin triggerTurn: false to get "no reply" in both idle and streaming.
-		pi.sendMessage(
-			{
-				customType: "pi-recheck:anchor",
-				content: [{ type: "text", text: anchor }],
-				display: true,
-				details: { hook: "anchor", compactionId: key },
-			},
-			{ triggerTurn: false },
-		);
+			const boundaryEntries = event?.context?.contextEntries ?? [];
+			const lastEntry = boundaryEntries[boundaryEntries.length - 1];
+			if (!lastEntry || isBoundaryCovered(lastEntry)) return;
+
+			const outcome = event?.outcome;
+			if (outcome === "error" || outcome === "aborted") return;
+
+			const messages = lastEntry.messages ?? [];
+			const lastMessage = messages[messages.length - 1];
+			if (!lastMessage || lastMessage.role !== "assistant") return;
+
+			const blocks = Array.isArray(lastMessage.content) ? lastMessage.content : [];
+			const text = blocks
+				.filter((block: any) => block.type === "text")
+				.map((block: any) => block.text ?? "")
+				.join("");
+			const hasToolCall = blocks.some((block: any) => block.type === "toolCall" || block.type === "tool_call");
+			if (!text && !hasToolCall) return; // nothing was claimed → nothing to check
+			if (hasPendingRecheckCheck(boundaryEntries)) return; // our check is pending — no loop
+
+			return {
+				entries: [
+					{
+						type: "custom_message",
+						customType: "pi-recheck:recheck",
+						// Verbatim asset text except the `<session id>` state-path
+						// marker, substituted above. customType is the machine marker.
+						content: [{ type: "text", text: renderPrompt(recheck, ctx) }],
+						display: false,
+						details: {},
+					},
+				],
+				continue: true,
+			};
+		} catch {
+			// Never throw: a rejected settle hook aborts the session.
+			return;
+		}
+	});
+
+	pi.on("session_compact", (event: any, ctx: ExtensionContext) => {
+		try {
+			if (isSubagentSession(process.env)) return;
+			if (isChildSession(ctx)) return;
+			if (event?.fromExtension) return;
+			if (!isEnabled(ctx.cwd)) return;
+
+			const anchor = loadPrompt(ctx.cwd, "anchor.md");
+			if (!anchor) return;
+
+			// No compaction-id memory: session_compact fires once per compaction,
+			// and replaying a range hits the same prompt anyway only via this path.
+			// triggerTurn pinned to false: history-only append, no steered reply.
+			// sendMessage is declared void but implemented async — swallow any
+			// rejection so a failed append cannot crash the session.
+			Promise.resolve(
+				pi.sendMessage(
+					{
+						customType: "pi-recheck:anchor",
+						content: [{ type: "text", text: renderPrompt(anchor, ctx) }],
+						display: false,
+						details: {},
+					},
+					{ triggerTurn: false },
+				),
+			).catch(() => {
+				// A failed anchor must not abort the session.
+			});
+		} catch {
+			// Never throw.
+			return;
+		}
 	});
 }

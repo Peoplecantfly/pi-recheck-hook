@@ -1,2 +1,2 @@
-After context compaction: re-read tasks/factory/00-obshchee.md, tasks/factory/state.md and the current task file.
-The summary does not replace them. Take questions, checklist items and task lists from the files, not from the summary.
+After context compaction: re-read this session's state from `.pi/pi-recheck-hook/<session id>/state.md`, and re-read `.pi/pi-recheck-hook/common.md` when it exists — project rules live there; a missing common.md is normal, skip it. If the session id in the state path looks unresolved, list `.pi/pi-recheck-hook/` to find this session's directory and name the one you picked.
+The summary does not replace these files: take questions, checklist items, task lists and rules from the files, not from the summary. With no state file, or an unclear session directory, take your next verification from the code and from commands you run, not from the summary.

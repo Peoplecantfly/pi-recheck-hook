@@ -10,8 +10,9 @@ published, or served — `package.json` has `"private": true` and declares exact
 "pi": { "extensions": ["./pi-extension/index.ts"] }
 ```
 
-There is **no README, no CONTRIBUTING, no CI, and no formatter, linter, type-checker, or
-test-runner configuration** in this repository. Do not search for `.eslintrc`, `tsconfig.json`,
+There is **no CONTRIBUTING, no CI, and no formatter, linter, type-checker, or
+test-runner configuration** in this repository (`README.md` exists but is hand-maintained prose —
+keep it synced with `index.ts` behavior when behavior changes). Do not search for `.eslintrc`, `tsconfig.json`,
 `biome.json`, `.prettierrc`, or `.github/workflows` — none exist. Do not add build/publish tooling
 without being asked.
 
@@ -44,23 +45,46 @@ support cannot run the tests or the extension.
   They also rewrite `process.env.HOME` (`withHome`) and clear `PI_RECHECK`,
   `PI_RECHECK_ASSETS_DIR`, and the four `PI_SUBAGENT_*` vars per test — run them in a clean env,
   and do not assume the real `~/.pi` is consulted while they run.
-- **Assets are cached per cwd.** `resolveAssets()` memoizes results in a module-level
-  `promptsByCwd` map. Changing an asset file after the first handler call for that cwd will not
-  take effect within the same process.
-- **Asset resolution order** (first hit wins, checked per file):
+- **No asset cache (2026-10-16 rework).** `loadPrompt()` walks the asset chain on every call;
+  there is no `promptsByCwd` memo anymore. Asset edits take effect on the next event.
+- **Asset resolution order** (first non-blank hit wins, checked per file):
   1. `$PI_RECHECK_ASSETS_DIR` (if set)
   2. `<cwd>/.pi/pi-recheck-hook/assets`
   3. `~/.pi/agent/extension-data/pi-recheck-hook/assets`
   4. `<module>/../assets` (the bundled files in this repo)
 
-  An unreadable file counts as missing and the chain continues; no hit at all → empty string →
-  handler stays silent.
-- **Hooks only fire in the right kind of project.** Both hooks bail unless the cwd contains
-  `tasks/factory/00-obshchee.md` or `workshop/tasks/factory/00-obshchee.md`
-  (`TASK_FILE_PATHS`). Running pi from a checkout of this repo will do nothing, and a new
-  task-file layout that uses different paths must be added to `TASK_FILE_PATHS`.
+  A missing, unreadable, **or blank** file counts as missing and the chain continues; no hit at
+  all → empty string → handler stays silent.
+- **State and rules are prompt-only.** Session state lives at
+  `.pi/pi-recheck-hook/<session id>/state.md` (per pi session, in the project cwd); project
+  rules, when the user writes them, at `.pi/pi-recheck-hook/common.md` — the anchor prompt tells
+  the model to re-read both at every compaction. These paths are named in prompt text only: the
+  extension never reads, writes, lists, or checks them; both are optional. Before injection,
+  `renderPrompt()` replaces the literal `<session id>` marker with
+  `ctx.sessionManager.getSessionId()` when pi exposes one — without an id the text stays
+  byte-identical to the asset (what the verbatim tests pin). The model keeps the file itself;
+  when several session directories exist, the prompts tell it to name the one it picked.
+- **No auto-turn cap in pi 1.3.0 — the recheck loop brake is in the hook.** There is no
+  `maxTurns`/`maxIterations` anywhere in the installed pi dist; `agent_before_settle` fires again
+  after every auto-turn (`_runBeforeSettleBoundary`, `agent-session.js:1538`).
+  `hasPendingRecheckCheck()` scans `event.context.contextEntries` backwards, skips `assistant`
+  and `toolResult` messages, and stays silent when the first non-model message is a
+  `custom_message` with `customType: "pi-recheck:recheck"` — a check of ours is already pending.
+  Matching the asset's `[Recheck]` text would be dead code: no prompt contains it.
+- **Entry/compaction ids do NOT dedupe anything (2026-10-16 rework).** There are no
+  `checkedEntries`/`anchoredCompactions` Sets anymore: within one replay the projected context
+  only grows, so entry ids keep changing and an id-keyed Set never fires. The pending-check
+  guard is the only brake on the recheck.
+- **Enablement is config-driven, default OFF (the task-file gate is gone).** Chain, first
+  decisive answer wins: `$PI_RECHECK` (`"0"|"false"|"off"` → off, `"1"|"true"|"on"` → on,
+  anything else → continue) → `<cwd>/.pi/pi-recheck-hook/settings.json` →
+  `~/.pi/agent/extension-data/pi-recheck-hook/settings.json` → nothing → **disabled**. A
+  settings file counts as present only when it parses to an object with a boolean `enabled`;
+  bad JSON, `"yes"` strings, or empty objects are "absent" and the chain continues. Running pi
+  from a checkout of this repo does nothing until one of those switches is set.
 - **Suppression flags are env-var driven:** `PI_RECHECK=0` disables the recheck hook;
-  subagent sessions are skipped via any of `PI_SUBAGENT_SESSION|ID|NAME|AGENT`.
+  subagent sessions are skipped via any of `PI_SUBAGENT_SESSION|ID|NAME|AGENT`; in-process
+  child sessions are skipped via the `parentSession` header. Anchor also honors `PI_RECHECK=0`.
 - **Test prompt assertions read the real files.** `bundledRecheck()` / `bundledAnchor()`
   `readFileSync` `assets/*.md`, so tests compare verbatim content rather than fixed expected
   strings — rewriting a prompt will not fail a test, but any logic change will.
