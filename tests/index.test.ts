@@ -221,14 +221,18 @@ function makeTempCopy(assets) {
 
 // ===================== Requirement: enablement is config-driven =====================
 
-test("disabled by default: no settings.json → no recheck, no anchor, no .pi side effects", () => {
+test("disabled by default: no settings.json → no recheck, no anchor, no .pi side effects", async () => {
 	clearEnv();
 	const cwd = makeProject();
-	const { handlers, sent } = setup();
-	const res = handlers.agent_before_settle(assistantSettle(), { cwd });
-	assert.ok(!res || !res.entries, "recheck must stay silent with no config");
-	handlers.session_compact(compactEvent(), { cwd });
-	assert.equal(sent.length, 0, "anchor must stay silent with no config");
+	// Pin HOME to an empty dir: the real ~/.pi may hold a global settings.json,
+	// which would silently flip this case to "enabled".
+	await withHome(makeHome(), () => {
+		const { handlers, sent } = setup();
+		const res = handlers.agent_before_settle(assistantSettle(), { cwd });
+		assert.ok(!res || !res.entries, "recheck must stay silent with no config");
+		handlers.session_compact(compactEvent(), { cwd });
+		assert.equal(sent.length, 0, "anchor must stay silent with no config");
+	});
 	assert.ok(!existsSync(join(cwd, ".pi")), "disabled extension must not create .pi/pi-recheck-hook");
 });
 
@@ -244,13 +248,15 @@ test("recheck fires when local settings.json enables the hooks", () => {
 	assert.equal(res.continue, true);
 });
 
-test("task-file layout is irrelevant: fires without, with workshop-, and with root task files", () => {
+test("task-file layout is irrelevant: fires without, with workshop-, and with root task files", async () => {
 	clearEnv();
 	for (const files of [[], ["workshop/tasks/factory/00-obshchee.md"], ["tasks/factory/00-obshchee.md"]]) {
 		const cwd = enabledProject({ files });
-		const { handlers } = setup();
-		const res = handlers.agent_before_settle(assistantSettle(`layout-${files.length}`), { cwd });
-		assert.ok(res && res.entries, `must fire for layout ${JSON.stringify(files)}`);
+		await withHome(makeHome(), () => {
+			const { handlers } = setup();
+			const res = handlers.agent_before_settle(assistantSettle(`layout-${files.length}`), { cwd });
+			assert.ok(res && res.entries, `must fire for layout ${JSON.stringify(files)}`);
+		});
 	}
 });
 
