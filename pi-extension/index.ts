@@ -26,6 +26,9 @@
  *   → ~/.pi/agent/extension-data/pi-recheck-hook/settings.json (global)
  *   → nothing → DISABLED. A settings file that is missing, unparseable, or
  *   without a boolean "enabled" counts as absent; the chain continues.
+ *   The same chain carries an optional boolean "subagents" (default true):
+ *   it gates the hooks in subagent/child sessions only — the main session
+ *   always runs whenever "enabled" allows it (see below).
  *
  * The task-file layout gate is gone (2026-10-16 rework) and no task paths
  * remain in code or prompts. State lives in `.pi/pi-recheck-hook/state.md`,
@@ -35,11 +38,16 @@
  * substitution): which path the model uses is whatever the asset says, so a
  * custom asset may point the state file and rules anywhere else.
  *
- * Subagent sessions are NOT skipped (2026-10-18 rework): in-process children
- * (e.g. @tintinweb/pi-subagents) load this extension through their own
- * session's extension binding, and process-spawned workers (e.g. pi-squad)
- * run a full pi process with the same extensions — so a subagent rechecks
- * its own turns too, since only its final answer reaches the orchestrator.
+ * Subagent sessions are NOT skipped by default (2026-10-18 rework):
+ * in-process children (e.g. @tintinweb/pi-subagents) load this extension
+ * through their own session's extension binding, and process-spawned workers
+ * (e.g. pi-squad) run a full pi process with the same extensions — so a
+ * subagent rechecks its own turns too, since only its final answer reaches
+ * the orchestrator. Detection is the pre-rework markers: any PI_SUBAGENT_*
+ * env var (PI_SUBAGENT_SESSION|ID|NAME|AGENT) or a parentSession entry in
+ * the session header (ctx.sessionManager.getHeader()). Settings
+ * "subagents": false silences both hooks in exactly those sessions; the
+ * main session is never affected by the flag.
  * All agents in one cwd share the single state file; the prompt gives each
  * agent its own `## <agent name>` section and tells it to edit only that
  * section — containment for the read-modify-write race under parallel agents.
@@ -97,6 +105,50 @@ function isEnabled(cwd: string): boolean {
 		if (global !== null) return global;
 	}
 	return false; // default: OFF — the hook only works when switched on
+}
+
+/** Read `{ "subagents": boolean }`; anything else (bad JSON, wrong type) is absent. */
+function readSubagentsFlag(path: string): boolean | null {
+	try {
+		if (!existsSync(path)) return null;
+		const data = JSON.parse(readFileSync(path, "utf8"));
+		if (typeof data !== "object" || data === null) return null;
+		const flag = (data as Record<string, unknown>).subagents;
+		return typeof flag === "boolean" ? flag : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Do the hooks fire in subagent/child sessions? Default TRUE — the
+ * 2026-10-18 behavior (recheck everywhere) stays when no settings file
+ * carries the flag. First boolean "subagents" in the settings chain wins
+ * (project → global). There is no env-var switch for this: $PI_RECHECK
+ * remains the global kill switch. */
+function areSubagentsEnabled(cwd: string): boolean {
+	const project = readSubagentsFlag(join(cwd, CONFIG_DIR, "settings.json"));
+	if (project !== null) return project;
+	const home = homeDir();
+	if (home) {
+		const global = readSubagentsFlag(join(home, GLOBAL_STATE_DIR, "settings.json"));
+		if (global !== null) return global;
+	}
+	return true;
+}
+
+/** Subagent (worker) sessions carry PI_SUBAGENT_* markers in the environment. */
+function isSubagentSession(env: NodeJS.ProcessEnv): boolean {
+	return Boolean(env.PI_SUBAGENT_SESSION || env.PI_SUBAGENT_ID || env.PI_SUBAGENT_NAME || env.PI_SUBAGENT_AGENT);
+}
+
+/** Child (in-process forked) sessions carry a parentSession in the header. */
+function isChildSession(ctx: ExtensionContext): boolean {
+	try {
+		const header = (ctx as any)?.sessionManager?.getHeader?.();
+		return Boolean(header?.parentSession);
+	} catch {
+		return false;
+	}
 }
 
 function assetsRoots(cwd: string): string[] {
@@ -170,13 +222,23 @@ export default function (pi: ExtensionAPI) {
 					const enabled = arg === "on";
 					const path = join(cwd, CONFIG_DIR, "settings.json");
 					mkdirSync(dirname(path), { recursive: true });
-					writeFileSync(path, `${JSON.stringify({ enabled }, null, 2)}\n`);
+					// Merge into the existing file so other keys (e.g. "subagents")
+					// survive the rewrite.
+					let existing: Record<string, unknown> = {};
+					try {
+						const parsed = JSON.parse(readFileSync(path, "utf8"));
+						if (typeof parsed === "object" && parsed !== null) existing = parsed as Record<string, unknown>;
+					} catch {
+						// Missing or broken file — start fresh.
+					}
+					writeFileSync(path, `${JSON.stringify({ ...existing, enabled }, null, 2)}\n`);
 					notify(`pi-recheck-hook ${enabled ? "enabled" : "disabled"} — ${path}`, enabled ? "info" : "warning");
 				} else if (arg) {
 					notify("usage: /recheck [on|off]", "info");
 				} else {
+					const on = isEnabled(cwd);
 					notify(
-						`checker: ${isEnabled(cwd) ? "ON" : "OFF"} (default OFF; /recheck on to enable)`,
+						`checker: ${on ? "ON" : "OFF"}${on ? `, subagents: ${areSubagentsEnabled(cwd) ? "on" : "off"}` : ""} (default OFF; /recheck on to enable)`,
 						"info",
 					);
 				}
@@ -193,6 +255,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_before_settle", (event: any, ctx: ExtensionContext) => {
 		try {
 			if (!isEnabled(ctx.cwd)) return;
+			// Main sessions always run when enabled; subagent/child sessions
+			// additionally need the settings "subagents" flag (default true).
+			if ((isSubagentSession(process.env) || isChildSession(ctx)) && !areSubagentsEnabled(ctx.cwd)) return;
 
 			const recheck = loadPrompt(ctx.cwd, "recheck.md");
 			if (!recheck) return; // no prompt file anywhere → stay silent
@@ -242,6 +307,8 @@ export default function (pi: ExtensionAPI) {
 		try {
 			if (event?.fromExtension) return;
 			if (!isEnabled(ctx.cwd)) return;
+			// Same subagent gate as the recheck hook (see above).
+			if ((isSubagentSession(process.env) || isChildSession(ctx)) && !areSubagentsEnabled(ctx.cwd)) return;
 
 			const anchor = loadPrompt(ctx.cwd, "anchor.md");
 			if (!anchor) return;

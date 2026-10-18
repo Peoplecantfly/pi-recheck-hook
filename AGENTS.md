@@ -42,8 +42,8 @@ support cannot run the tests or the extension.
 
 - **Tests need no running pi session.** `tests/index.test.ts` builds a fake `ExtensionAPI`
   (`makePi()`) and invokes handlers with hand-made events, so they pass without a real session.
-  They also rewrite `process.env.HOME` (`withHome`) and clear `PI_RECHECK` and
-  `PI_RECHECK_ASSETS_DIR` per test — run them in a clean env,
+  They also rewrite `process.env.HOME` (`withHome`) and clear `PI_RECHECK`,
+  `PI_RECHECK_ASSETS_DIR`, and the four `PI_SUBAGENT_*` vars per test — run them in a clean env,
   and do not assume the real `~/.pi` is consulted while they run.
 - **No asset cache (2026-10-16 rework).** `loadPrompt()` walks the asset chain on every call;
   there is no `promptsByCwd` memo anymore. Asset edits take effect on the next event.
@@ -81,13 +81,19 @@ support cannot run the tests or the extension.
   anything else → continue) → `<cwd>/.pi/pi-recheck-hook/settings.json` →
   `~/.pi/agent/extension-data/pi-recheck-hook/settings.json` → nothing → **disabled**. A
   settings file counts as present only when it parses to an object with a boolean `enabled`;
-  bad JSON, `"yes"` strings, or empty objects are "absent" and the chain continues. Running pi
-  from a checkout of this repo does nothing until one of those switches is set.
-- **Suppression is only `PI_RECHECK=0`** (both hooks). Subagent skipping is gone (2026-10-18
-  rework): in-process children (e.g. @tintinweb/pi-subagents) load the extension through their
-  own session binding and process-spawned workers (e.g. pi-squad) run a full pi process, so the
-  hook fires in subagent sessions too — `PI_SUBAGENT_*` env vars and the `parentSession` header
-  are no longer checked.
+  bad JSON, `"yes"` strings, or empty objects are "absent" and the chain continues. The same
+  chain carries an optional boolean `subagents` (default `true`): `false` silences both hooks
+  in subagent/child sessions only (first boolean in the chain wins; non-boolean is absent),
+  never the main session. Note: `/recheck on|off` merges `enabled` into the existing file, so
+  `subagents` survives the rewrite. Running pi from a checkout of this repo does nothing until
+  one of those switches is set.
+- **Subagent detection is back, but only to apply `subagents: false` (2026-10-18).**
+  Global suppression is `PI_RECHECK=0` (both hooks). Subagent sessions fire by default:
+  in-process children (e.g. @tintinweb/pi-subagents) load the extension through their own
+  session binding and process-spawned workers (e.g. pi-squad) run a full pi process. A session
+  counts as subagent when any `PI_SUBAGENT_*` env var (`SESSION|ID|NAME|AGENT`) is set or
+  `ctx.sessionManager.getHeader()` carries `parentSession` — that is the only effect of the
+  markers: `settings.json` `"subagents": false` silences exactly those sessions.
 - **Test prompt assertions read the real files.** `bundledRecheck()` / `bundledAnchor()`
   `readFileSync` `assets/*.md`, so tests compare verbatim content rather than fixed expected
   strings — rewriting a prompt will not fail a test, but any logic change will.

@@ -15,8 +15,10 @@
 //   · State path: prompts name the fixed `.pi/pi-recheck-hook/state.md` in
 //     the asset text; the injected text is the asset verbatim (no
 //     substitution), so a custom asset may point the state file anywhere.
-//   · Subagent sessions are NOT skipped: child sessions (parentSession
-//     header) and PI_SUBAGENT_* env markers no longer suppress either hook.
+//   · Subagent sessions fire BY DEFAULT (child sessions with a parentSession
+//     header, PI_SUBAGENT_* env markers). Settings "subagents": false
+//     (project → global chain, default true) silences both hooks in exactly
+//     those sessions; the main session always runs when enabled.
 //   · /recheck enable|disable (runtime command) is tested in its own section.
 //
 // Note: the real extension's bundled dir always holds recheck.md/anchor.md,
@@ -135,6 +137,10 @@ function customEntry(id, customType, text) {
 function clearEnv() {
 	delete process.env.PI_RECHECK;
 	delete process.env.PI_RECHECK_ASSETS_DIR;
+	delete process.env.PI_SUBAGENT_SESSION;
+	delete process.env.PI_SUBAGENT_ID;
+	delete process.env.PI_SUBAGENT_NAME;
+	delete process.env.PI_SUBAGENT_AGENT;
 }
 
 /** Write `content` at `relPath` under `root`, creating parent dirs. */
@@ -306,23 +312,25 @@ test("PI_RECHECK=0 kills both hooks even when config enables them", () => {
 	assert.equal(sent.length, 0, "anchor must respect PI_RECHECK=0 too (p.4 fix)");
 });
 
-// ===================== Requirement: subagent sessions fire too =====================
+// ===================== Requirement: subagent sessions (config-gated) =====================
 
-test("subagent env markers no longer suppress (any PI_SUBAGENT_* set, even when enabled)", () => {
+test("subagent env markers do not suppress by default (no subagents flag in settings)", async () => {
 	clearEnv();
-	for (const key of ["PI_SUBAGENT_SESSION", "PI_SUBAGENT_ID", "PI_SUBAGENT_NAME", "PI_SUBAGENT_AGENT"]) {
-		clearEnv();
-		process.env[key] = "1";
-		const cwd = enabledProject();
-		const { handlers, sent } = setup();
-		const res = handlers.agent_before_settle(assistantSettle(`sub-${key}`), { cwd });
-		assert.ok(res && res.entries, `recheck must fire when ${key} set`);
-		handlers.session_compact(compactEvent(`sub-${key}`), { cwd });
-		assert.equal(sent.length, 1, `anchor must fire when ${key} set`);
-	}
+	await withHome(makeHome(), () => {
+		for (const key of ["PI_SUBAGENT_SESSION", "PI_SUBAGENT_ID", "PI_SUBAGENT_NAME", "PI_SUBAGENT_AGENT"]) {
+			clearEnv();
+			process.env[key] = "1";
+			const cwd = enabledProject();
+			const { handlers, sent } = setup();
+			const res = handlers.agent_before_settle(assistantSettle(`sub-${key}`), { cwd });
+			assert.ok(res && res.entries, `recheck must fire when ${key} set (default on)`);
+			handlers.session_compact(compactEvent(`sub-${key}`), { cwd });
+			assert.equal(sent.length, 1, `anchor must fire when ${key} set (default on)`);
+		}
+	});
 });
 
-test("in-process child sessions (parentSession in header) still fire", () => {
+test("in-process child sessions (parentSession in header) still fire by default", () => {
 	clearEnv();
 	const cwd = enabledProject();
 	const childCtx = {
@@ -335,6 +343,81 @@ test("in-process child sessions (parentSession in header) still fire", () => {
 	assert.equal(res.entries[0].customType, "pi-recheck:recheck");
 	handlers.session_compact(compactEvent("child-1"), childCtx);
 	assert.equal(sent.length, 1, "anchor must fire in child sessions");
+});
+
+test("subagents:false in project settings silences subagent sessions only", async () => {
+	clearEnv();
+	const cwd = makeProject({ settings: '{"enabled": true, "subagents": false}' });
+	await withHome(makeHome(), async () => {
+		// Subagent session → both hooks silent.
+		process.env.PI_SUBAGENT_NAME = "worker";
+		const sub = setup();
+		const subRes = sub.handlers.agent_before_settle(assistantSettle("sub-off"), { cwd });
+		assert.ok(!subRes || !subRes.entries, "recheck must stay silent in subagent sessions when subagents:false");
+		sub.handlers.session_compact(compactEvent("sub-off"), { cwd });
+		assert.equal(sub.sent.length, 0, "anchor must stay silent in subagent sessions when subagents:false");
+		delete process.env.PI_SUBAGENT_NAME;
+
+		// Main session in the same project → both hooks still fire.
+		const main = setup();
+		const mainRes = main.handlers.agent_before_settle(assistantSettle("main-off"), { cwd });
+		assert.ok(mainRes && mainRes.entries, "recheck must fire in the main session when subagents:false");
+		main.handlers.session_compact(compactEvent("main-off"), { cwd });
+		assert.equal(main.sent.length, 1, "anchor must fire in the main session when subagents:false");
+	});
+});
+
+test("subagents:false in global settings suppresses subagents when the project file lacks the flag", async () => {
+	clearEnv();
+	const home = makeHome({ settings: '{"enabled": true, "subagents": false}' });
+	const cwd = makeProject({ settings: ENABLED });
+	await withHome(home, async () => {
+		process.env.PI_SUBAGENT_ID = "w1";
+		const { handlers, sent } = setup();
+		const res = handlers.agent_before_settle(assistantSettle("glob-sub"), { cwd });
+		assert.ok(!res || !res.entries, "global subagents:false must silence the recheck in subagent sessions");
+		handlers.session_compact(compactEvent("glob-sub"), { cwd });
+		assert.equal(sent.length, 0, "global subagents:false must silence the anchor in subagent sessions");
+	});
+});
+
+test("child session (parentSession header) is silenced by subagents:false too", async () => {
+	clearEnv();
+	const cwd = makeProject({ settings: '{"enabled": true, "subagents": false}' });
+	const childCtx = {
+		cwd,
+		sessionManager: { getHeader: () => ({ type: "session", id: "child", parentSession: "/sessions/parent.jsonl" }) },
+	};
+	await withHome(makeHome(), async () => {
+		const { handlers } = setup();
+		const res = handlers.agent_before_settle(assistantSettle("child-off"), childCtx);
+		assert.ok(!res || !res.entries, "child sessions must respect subagents:false");
+	});
+});
+
+test("non-boolean subagents counts as absent (default: fire in subagents)", async () => {
+	clearEnv();
+	const cwd = makeProject({ settings: '{"enabled": true, "subagents": "no"}' });
+	await withHome(makeHome(), async () => {
+		process.env.PI_SUBAGENT_SESSION = "s1";
+		const { handlers } = setup();
+		const res = handlers.agent_before_settle(assistantSettle("nonbool"), { cwd });
+		assert.ok(res && res.entries, "a non-boolean subagents must be ignored (default true)");
+	});
+});
+
+test("PI_RECHECK=1 force-on still respects subagents:false from settings", async () => {
+	clearEnv();
+	// enabled only via the env switch; the settings file carries no "enabled"
+	// key, only "subagents" — the two chains are independent.
+	const cwd = makeProject({ settings: '{"subagents": false}' });
+	await withHome(makeHome(), async () => {
+		process.env.PI_RECHECK = "1";
+		process.env.PI_SUBAGENT_AGENT = "sq-1";
+		const { handlers } = setup();
+		const res = handlers.agent_before_settle(assistantSettle("force-sub"), { cwd });
+		assert.ok(!res || !res.entries, "env force-on must not override subagents:false in subagent sessions");
+	});
 });
 
 // ===================== Requirement: fixed state path, verbatim asset =====================
@@ -640,6 +723,19 @@ test("/recheck on|off rewrites settings.json and the hooks follow it", async () 
 	assert.equal(readFileSync(settingsPath, "utf8"), '{\n  "enabled": false\n}\n');
 	const off = handlers.agent_before_settle(assistantSettle("cmd-off"), { cwd });
 	assert.ok(!off || !off.entries, "after /recheck off the hooks must stay silent");
+});
+
+test("/recheck on|off preserves other settings keys (subagents)", async () => {
+	clearEnv();
+	const cwd = makeProject({ settings: '{"enabled": false, "subagents": false}' });
+	const { commands } = setup();
+	const ctx = { cwd, ui: { notify: () => {} } };
+	await commands.recheck.handler("on", ctx);
+	assert.equal(
+		readFileSync(join(cwd, ".pi", "pi-recheck-hook", "settings.json"), "utf8"),
+		'{\n  "enabled": true,\n  "subagents": false\n}\n',
+		"the rewrite must keep the subagents key",
+	);
 });
 
 test("/recheck with a broken settings dir must not throw", async () => {

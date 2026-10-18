@@ -22,7 +22,8 @@ still append an entry and ask for another model request. `turn_end` fires per tu
 `agent_settled` is notification-only, so neither is used.
 
 Suppressed when: `PI_RECHECK` is `0`/`false`/`off`; the hook is not enabled (see Scope — default
-is OFF); no non-blank prompt file exists in the asset chain; the last entry is a `compaction` or
+is OFF); in subagent/child sessions, when `settings.json` carries `"subagents": false` (the main
+session is unaffected); no non-blank prompt file exists in the asset chain; the last entry is a `compaction` or
 `branch_summary`; the outcome was `aborted` or `error`; the turn did not end with an assistant
 message that claimed something (text or toolCall); or our own `recheck.md` is already the latest
 non-model message in the context (`customType: "pi-recheck:recheck"`) — pi 1.3.0 has no auto-turn
@@ -44,12 +45,14 @@ verified code and commands.
 > (`session_compact`) — which is what the requirement actually asks for: keep the pointer to the
 > files, don't trust the summary.
 
-**Subagents recheck too.** The hooks fire in subagent sessions as well: in-process children
+**Subagents recheck too.** The hooks fire in subagent sessions by default: in-process children
 (e.g. `@tintinweb/pi-subagents`) load this extension through their own session's extension
 binding, and process-spawned workers (e.g. `pi-squad`) run a full pi process with the same
 extensions — so each subagent rechecks its own turns, since only its final answer reaches the
 orchestrator. All agents in one cwd share the single state file; the prompt gives each
-agent its own `## <agent name>` section and tells it to edit only that section.
+agent its own `## <agent name>` section and tells it to edit only that section. Set
+`"subagents": false` in `settings.json` (project or global) to silence both hooks in exactly
+those sessions — the main session keeps running (see Scope).
 
 ## Layout
 
@@ -77,7 +80,7 @@ declared in `package.json` under `pi.extensions`. Prompt text is resolved at run
 | Variable | Effect |
 | --- | --- |
 | `PI_RECHECK` | Kill/force switch: `0`/`false`/`off` forces the hooks off, `1`/`true`/`on` forces them on; anything else defers to settings. |
-| `settings.json` | `{ "enabled": true|false }` in `<cwd>/.pi/pi-recheck-hook/` or `~/.pi/agent/extension-data/pi-recheck-hook/`. A file that is missing, unparseable, or without a boolean `enabled` counts as absent. Also manageable via `/recheck on|off`. |
+| `settings.json` | `{ "enabled": true|false }` in `<cwd>/.pi/pi-recheck-hook/` or `~/.pi/agent/extension-data/pi-recheck-hook/`. A file that is missing, unparseable, or without a boolean `enabled` counts as absent. Optional `"subagents": true|false` (default `true`) gates both hooks in subagent/child sessions only. Manageable via `/recheck on|off`, which merges into the existing file. |
 | `PI_RECHECK_ASSETS_DIR` | Extra top-priority assets dir. |
 
 Assets are resolved per **file**, first hit wins:
@@ -95,7 +98,10 @@ takes effect on the next event.
 
 Enablement is config-driven, default **OFF**: `$PI_RECHECK` → project `settings.json` → global
 `settings.json` → nothing means disabled. Both hooks inject nothing until one of those switches
-says on. The old task-file gate was removed in the 2026-10-16 rework; task paths are gone from
+says on. The same chain carries an optional boolean `subagents` (default **true**): when
+`false`, both hooks stay silent in subagent/child sessions (any `PI_SUBAGENT_*` env var or a
+`parentSession` session header), while the main session always runs once enabled.
+The old task-file gate was removed in the 2026-10-16 rework; task paths are gone from
 code and prompts alike. State is one file per project dir: `.pi/pi-recheck-hook/state.md`,
 shared by the main session and every subagent in that cwd (each agent owns one `## <agent name>`
 section and is told to edit only its own); project rules live in `.pi/pi-recheck-hook/common.md` (the model is told to re-read
