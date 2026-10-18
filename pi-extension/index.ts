@@ -28,12 +28,20 @@
  *   without a boolean "enabled" counts as absent; the chain continues.
  *
  * The task-file layout gate is gone (2026-10-16 rework) and no task paths
- * remain in code or prompts. Session state lives in
- * `.pi/pi-recheck-hook/<session id>/state.md`, project rules in
- * `.pi/pi-recheck-hook/common.md` — the prompt text names them only; the
- * hook never reads, writes or creates them, and both are optional. Before
- * injection the `<session id>` marker in the prompt text is replaced with the
- * real id from `ctx.sessionManager.getSessionId()` when pi exposes one.
+ * remain in code or prompts. State lives in `.pi/pi-recheck-hook/state.md`,
+ * project rules in `.pi/pi-recheck-hook/common.md` — the prompt text names
+ * them only; the hook never reads, writes or creates them, and both are
+ * optional. The injected text is the asset file verbatim (no marker
+ * substitution): which path the model uses is whatever the asset says, so a
+ * custom asset may point the state file and rules anywhere else.
+ *
+ * Subagent sessions are NOT skipped (2026-10-18 rework): in-process children
+ * (e.g. @tintinweb/pi-subagents) load this extension through their own
+ * session's extension binding, and process-spawned workers (e.g. pi-squad)
+ * run a full pi process with the same extensions — so a subagent rechecks
+ * its own turns too, since only its final answer reaches the orchestrator.
+ * All agents in one cwd share the single state file; the prompt tells them
+ * to re-read before writing and merge, not clobber.
  *
  * Asset chain per prompt file (first non-blank hit wins): $PI_RECHECK_ASSETS_DIR
  * → <cwd>/.pi/pi-recheck-hook/assets → global extension-data assets → bundled
@@ -118,20 +126,6 @@ function loadPrompt(cwd: string, name: string): string {
 	return "";
 }
 
-function isSubagentSession(env: NodeJS.ProcessEnv): boolean {
-	return Boolean(env.PI_SUBAGENT_SESSION || env.PI_SUBAGENT_ID || env.PI_SUBAGENT_NAME || env.PI_SUBAGENT_AGENT);
-}
-
-/** Child (in-process forked) sessions carry a parentSession in the header. */
-function isChildSession(ctx: ExtensionContext): boolean {
-	try {
-		const header = (ctx as any)?.sessionManager?.getHeader?.();
-		return Boolean(header?.parentSession);
-	} catch {
-		return false;
-	 }
-}
-
 // No entry/compaction-id memory: the projected context only grows, so ids
 // repeat within one replay only, where the pending-check guard answers.
 
@@ -161,20 +155,6 @@ function hasPendingRecheckCheck(entries: any[]): boolean {
 	return false;
 }
 
-/** Replace the literal `<session id>` marker with the concrete session id when
- * pi exposes one (ReadonlySessionManager.getSessionId). Without an id the text
- * stays byte-identical to the asset file. */
-function renderPrompt(text: string, ctx: ExtensionContext): string {
-	if (!text.includes("<session id>")) return text;
-	let sessionId: string | undefined;
-	try {
-		sessionId = (ctx as any)?.sessionManager?.getSessionId?.();
-	} catch {
-		sessionId = undefined; // a getter failure must never abort the hook
-	}
-	return sessionId ? text.replaceAll("<session id>", sessionId) : text;
-}
-
 export default function (pi: ExtensionAPI) {
 	// /recheck [on|off|status] — manage the project-local setting.
 	pi.registerCommand("recheck", {
@@ -194,13 +174,10 @@ export default function (pi: ExtensionAPI) {
 				} else if (arg) {
 					notify("usage: /recheck [on|off]", "info");
 				} else {
-					const lines = [
+					notify(
 						`checker: ${isEnabled(cwd) ? "ON" : "OFF"} (default OFF; /recheck on to enable)`,
-						isSubagentSession(process.env)
-							? "subagent session detected (PI_SUBAGENT_*) — the hook never injects here"
-							: "not a subagent session (PI_SUBAGENT_* unset)",
-					];
-					notify(lines.join("\n"), "info");
+						"info",
+					);
 				}
 			} catch (error) {
 				try {
@@ -214,9 +191,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_before_settle", (event: any, ctx: ExtensionContext) => {
 		try {
-			// Subagent sessions: no injection — not as worker, not as orchestrator.
-			if (isSubagentSession(process.env)) return;
-			if (isChildSession(ctx)) return;
 			if (!isEnabled(ctx.cwd)) return;
 
 			const recheck = loadPrompt(ctx.cwd, "recheck.md");
@@ -247,9 +221,10 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "custom_message",
 						customType: "pi-recheck:recheck",
-						// Verbatim asset text except the `<session id>` state-path
-						// marker, substituted above. customType is the machine marker.
-						content: [{ type: "text", text: renderPrompt(recheck, ctx) }],
+						// Verbatim asset text — the state path in it is whatever
+						// the asset says (custom assets may name another one).
+						// customType is the machine marker.
+						content: [{ type: "text", text: recheck }],
 						display: false,
 						details: {},
 					},
@@ -264,8 +239,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_compact", (event: any, ctx: ExtensionContext) => {
 		try {
-			if (isSubagentSession(process.env)) return;
-			if (isChildSession(ctx)) return;
 			if (event?.fromExtension) return;
 			if (!isEnabled(ctx.cwd)) return;
 
@@ -281,7 +254,7 @@ export default function (pi: ExtensionAPI) {
 				pi.sendMessage(
 					{
 						customType: "pi-recheck:anchor",
-						content: [{ type: "text", text: renderPrompt(anchor, ctx) }],
+						content: [{ type: "text", text: anchor }],
 						display: false,
 						details: {},
 					},

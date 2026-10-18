@@ -42,8 +42,8 @@ support cannot run the tests or the extension.
 
 - **Tests need no running pi session.** `tests/index.test.ts` builds a fake `ExtensionAPI`
   (`makePi()`) and invokes handlers with hand-made events, so they pass without a real session.
-  They also rewrite `process.env.HOME` (`withHome`) and clear `PI_RECHECK`,
-  `PI_RECHECK_ASSETS_DIR`, and the four `PI_SUBAGENT_*` vars per test — run them in a clean env,
+  They also rewrite `process.env.HOME` (`withHome`) and clear `PI_RECHECK` and
+  `PI_RECHECK_ASSETS_DIR` per test — run them in a clean env,
   and do not assume the real `~/.pi` is consulted while they run.
 - **No asset cache (2026-10-16 rework).** `loadPrompt()` walks the asset chain on every call;
   there is no `promptsByCwd` memo anymore. Asset edits take effect on the next event.
@@ -55,15 +55,15 @@ support cannot run the tests or the extension.
 
   A missing, unreadable, **or blank** file counts as missing and the chain continues; no hit at
   all → empty string → handler stays silent.
-- **State and rules are prompt-only.** Session state lives at
-  `.pi/pi-recheck-hook/<session id>/state.md` (per pi session, in the project cwd); project
-  rules, when the user writes them, at `.pi/pi-recheck-hook/common.md` — the anchor prompt tells
-  the model to re-read both at every compaction. These paths are named in prompt text only: the
-  extension never reads, writes, lists, or checks them; both are optional. Before injection,
-  `renderPrompt()` replaces the literal `<session id>` marker with
-  `ctx.sessionManager.getSessionId()` when pi exposes one — without an id the text stays
-  byte-identical to the asset (what the verbatim tests pin). The model keeps the file itself;
-  when several session directories exist, the prompts tell it to name the one it picked.
+- **State and rules are prompt-only.** State lives at `.pi/pi-recheck-hook/state.md`
+  (one file per project cwd, shared by the main session and all subagents); project rules,
+  when the user writes them, at `.pi/pi-recheck-hook/common.md` — the anchor prompt tells the
+  model to re-read both at every compaction. These paths are named in prompt text only: the
+  extension never reads, writes, lists, or checks them; both are optional. The injected text
+  is the asset file verbatim — no `<session id>` substitution (2026-10-18 rework) — so a custom
+  asset may point the state file and rules anywhere else; the bundled assets name the fixed
+  paths above (what the verbatim tests pin). The model keeps the file itself and is told to
+  re-read before writing and merge, because several agents share it.
 - **No auto-turn cap in pi 1.3.0 — the recheck loop brake is in the hook.** There is no
   `maxTurns`/`maxIterations` anywhere in the installed pi dist; `agent_before_settle` fires again
   after every auto-turn (`_runBeforeSettleBoundary`, `agent-session.js:1538`).
@@ -82,9 +82,11 @@ support cannot run the tests or the extension.
   settings file counts as present only when it parses to an object with a boolean `enabled`;
   bad JSON, `"yes"` strings, or empty objects are "absent" and the chain continues. Running pi
   from a checkout of this repo does nothing until one of those switches is set.
-- **Suppression flags are env-var driven:** `PI_RECHECK=0` disables the recheck hook;
-  subagent sessions are skipped via any of `PI_SUBAGENT_SESSION|ID|NAME|AGENT`; in-process
-  child sessions are skipped via the `parentSession` header. Anchor also honors `PI_RECHECK=0`.
+- **Suppression is only `PI_RECHECK=0`** (both hooks). Subagent skipping is gone (2026-10-18
+  rework): in-process children (e.g. @tintinweb/pi-subagents) load the extension through their
+  own session binding and process-spawned workers (e.g. pi-squad) run a full pi process, so the
+  hook fires in subagent sessions too — `PI_SUBAGENT_*` env vars and the `parentSession` header
+  are no longer checked.
 - **Test prompt assertions read the real files.** `bundledRecheck()` / `bundledAnchor()`
   `readFileSync` `assets/*.md`, so tests compare verbatim content rather than fixed expected
   strings — rewriting a prompt will not fail a test, but any logic change will.

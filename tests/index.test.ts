@@ -12,9 +12,11 @@
 //   · Both hooks (recheck AND anchor) respect the enabled switch.
 //   · Asset chain per prompt file: PI_RECHECK_ASSETS_DIR → project
 //     .pi/pi-recheck-hook/assets → global extension-data assets → bundled.
-//   · State path: prompts carry a literal `<session id>` marker; the handler
-//     substitutes ctx.sessionManager.getSessionId() when available, and stays
-//     byte-identical to the asset when it is not.
+//   · State path: prompts name the fixed `.pi/pi-recheck-hook/state.md` in
+//     the asset text; the injected text is the asset verbatim (no
+//     substitution), so a custom asset may point the state file anywhere.
+//   · Subagent sessions are NOT skipped: child sessions (parentSession
+//     header) and PI_SUBAGENT_* env markers no longer suppress either hook.
 //   · /recheck enable|disable (runtime command) is tested in its own section.
 //
 // Note: the real extension's bundled dir always holds recheck.md/anchor.md,
@@ -133,10 +135,6 @@ function customEntry(id, customType, text) {
 function clearEnv() {
 	delete process.env.PI_RECHECK;
 	delete process.env.PI_RECHECK_ASSETS_DIR;
-	delete process.env.PI_SUBAGENT_SESSION;
-	delete process.env.PI_SUBAGENT_ID;
-	delete process.env.PI_SUBAGENT_NAME;
-	delete process.env.PI_SUBAGENT_AGENT;
 }
 
 /** Write `content` at `relPath` under `root`, creating parent dirs. */
@@ -308,9 +306,9 @@ test("PI_RECHECK=0 kills both hooks even when config enables them", () => {
 	assert.equal(sent.length, 0, "anchor must respect PI_RECHECK=0 too (p.4 fix)");
 });
 
-// ===================== Requirement: main-session-only =====================
+// ===================== Requirement: subagent sessions fire too =====================
 
-test("subagent sessions stay silent (any PI_SUBAGENT_* set, even when enabled)", () => {
+test("subagent env markers no longer suppress (any PI_SUBAGENT_* set, even when enabled)", () => {
 	clearEnv();
 	for (const key of ["PI_SUBAGENT_SESSION", "PI_SUBAGENT_ID", "PI_SUBAGENT_NAME", "PI_SUBAGENT_AGENT"]) {
 		clearEnv();
@@ -318,13 +316,13 @@ test("subagent sessions stay silent (any PI_SUBAGENT_* set, even when enabled)",
 		const cwd = enabledProject();
 		const { handlers, sent } = setup();
 		const res = handlers.agent_before_settle(assistantSettle(`sub-${key}`), { cwd });
-		assert.ok(!res || !res.entries, `recheck must skip when ${key} set`);
+		assert.ok(res && res.entries, `recheck must fire when ${key} set`);
 		handlers.session_compact(compactEvent(`sub-${key}`), { cwd });
-		assert.equal(sent.length, 0, `anchor must skip when ${key} set`);
+		assert.equal(sent.length, 1, `anchor must fire when ${key} set`);
 	}
 });
 
-test("in-process child sessions stay silent (parentSession in header)", () => {
+test("in-process child sessions (parentSession in header) still fire", () => {
 	clearEnv();
 	const cwd = enabledProject();
 	const childCtx = {
@@ -333,52 +331,37 @@ test("in-process child sessions stay silent (parentSession in header)", () => {
 	};
 	const { handlers, sent } = setup();
 	const res = handlers.agent_before_settle(assistantSettle("child-1"), childCtx);
-	assert.ok(!res || !res.entries, "recheck must skip child sessions");
-	handlers.session_compact(compactEvent("child-1"), childCtx);
-	assert.equal(sent.length, 0, "anchor must skip child sessions");
-});
-
-test("main session without parentSession header still fires when enabled", () => {
-	clearEnv();
-	const cwd = enabledProject();
-	const mainCtx = { cwd, sessionManager: { getHeader: () => ({ type: "session", id: "main" }) } };
-	const { handlers } = setup();
-	const res = handlers.agent_before_settle(assistantSettle("main-1"), mainCtx);
-	assert.ok(res && res.entries, "handler returned nothing");
+	assert.ok(res && res.entries, "recheck must fire in child sessions");
 	assert.equal(res.entries[0].customType, "pi-recheck:recheck");
+	handlers.session_compact(compactEvent("child-1"), childCtx);
+	assert.equal(sent.length, 1, "anchor must fire in child sessions");
 });
 
-// ===================== Requirement: concrete state path =====================
+// ===================== Requirement: fixed state path, verbatim asset =====================
 
-test("state path is substituted with the real session id when pi exposes it", () => {
+test("injected text is the asset verbatim — no session-id substitution", () => {
 	clearEnv();
 	const cwd = enabledProject();
 	const { handlers, sent } = setup();
+	// A ctx that DOES expose getSessionId: the hook must ignore it — the path
+	// is whatever the asset text says, nothing is substituted in.
 	const ctx = {
 		cwd,
 		sessionManager: { getHeader: () => ({ type: "session", id: "main" }), getSessionId: () => "cafebabe" },
 	};
 	const res = handlers.agent_before_settle(assistantSettle("inject-1"), ctx);
 	assert.ok(res && res.entries, "recheck must fire");
-	const recheckText = res.entries[0].content[0].text;
-	assert.ok(!recheckText.includes("<session id>"), "recheck placeholder must be substituted");
-	assert.ok(recheckText.includes(".pi/pi-recheck-hook/cafebabe/state.md"), "recheck must name the concrete state path");
+	assert.equal(res.entries[0].content[0].text, bundledRecheck(), "recheck must be byte-identical to the asset");
 	handlers.session_compact(compactEvent("inject-1"), ctx);
 	assert.equal(sent.length, 1, "anchor must fire once");
-	const anchorText = sent[0].message.content[0].text;
-	assert.ok(!anchorText.includes("<session id>"), "anchor placeholder must be substituted");
-	assert.ok(anchorText.includes(".pi/pi-recheck-hook/cafebabe/state.md"), "anchor must name the concrete state path");
+	assert.equal(sent[0].message.content[0].text, bundledAnchor(), "anchor must be byte-identical to the asset");
 });
 
-test("prompts stay byte-identical to the asset when session id is unavailable", () => {
-	clearEnv();
-	const cwd = enabledProject();
-	const { handlers, sent } = setup();
-	const res = handlers.agent_before_settle(assistantSettle("noid-1"), { cwd });
-	assert.ok(res && res.entries, "recheck must fire");
-	assert.equal(res.entries[0].content[0].text, bundledRecheck());
-	handlers.session_compact(compactEvent("noid-1"), { cwd });
-	assert.equal(sent[0].message.content[0].text, bundledAnchor());
+test("bundled assets name the fixed state path and carry no session-id marker", () => {
+	assert.ok(bundledRecheck().includes(".pi/pi-recheck-hook/state.md"), "recheck must name .pi/pi-recheck-hook/state.md");
+	assert.ok(bundledAnchor().includes(".pi/pi-recheck-hook/state.md"), "anchor must name .pi/pi-recheck-hook/state.md");
+	assert.ok(!bundledRecheck().includes("<session id>"), "recheck must not carry a <session id> marker");
+	assert.ok(!bundledAnchor().includes("<session id>"), "anchor must not carry a <session id> marker");
 });
 
 // ===================== Requirement: once-per-turn / skip semantics =====================
