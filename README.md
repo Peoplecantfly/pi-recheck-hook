@@ -48,8 +48,8 @@ verified code and commands.
 (e.g. `@tintinweb/pi-subagents`) load this extension through their own session's extension
 binding, and process-spawned workers (e.g. `pi-squad`) run a full pi process with the same
 extensions — so each subagent rechecks its own turns, since only its final answer reaches the
-orchestrator. All agents in one cwd share the single state file; the prompt tells them to
-re-read before writing and merge, not clobber.
+orchestrator. All agents in one cwd share the single state file; the prompt gives each
+agent its own `## <agent name>` section and tells it to edit only that section.
 
 ## Layout
 
@@ -97,8 +97,8 @@ Enablement is config-driven, default **OFF**: `$PI_RECHECK` → project `setting
 `settings.json` → nothing means disabled. Both hooks inject nothing until one of those switches
 says on. The old task-file gate was removed in the 2026-10-16 rework; task paths are gone from
 code and prompts alike. State is one file per project dir: `.pi/pi-recheck-hook/state.md`,
-shared by the main session and every subagent in that cwd (the prompt tells them to merge, not
-clobber); project rules live in `.pi/pi-recheck-hook/common.md` (the model is told to re-read
+shared by the main session and every subagent in that cwd (each agent owns one `## <agent name>`
+section and is told to edit only its own); project rules live in `.pi/pi-recheck-hook/common.md` (the model is told to re-read
 it at every anchor). Both are optional and named in prompt text only — the hook never reads or
 writes either, and the injected text is the asset verbatim, so a custom asset may point the
 state file and rules anywhere else.

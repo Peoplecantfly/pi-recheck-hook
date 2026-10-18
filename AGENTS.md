@@ -63,7 +63,8 @@ support cannot run the tests or the extension.
   is the asset file verbatim — no `<session id>` substitution (2026-10-18 rework) — so a custom
   asset may point the state file and rules anywhere else; the bundled assets name the fixed
   paths above (what the verbatim tests pin). The model keeps the file itself and is told to
-  re-read before writing and merge, because several agents share it.
+  re-read the file before writing and edit only its own `## <agent name>` section — that
+  contains the read-modify-write race to a single section.
 - **No auto-turn cap in pi 1.3.0 — the recheck loop brake is in the hook.** There is no
   `maxTurns`/`maxIterations` anywhere in the installed pi dist; `agent_before_settle` fires again
   after every auto-turn (`_runBeforeSettleBoundary`, `agent-session.js:1538`).

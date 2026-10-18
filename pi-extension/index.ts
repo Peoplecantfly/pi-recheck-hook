@@ -40,8 +40,9 @@
  * session's extension binding, and process-spawned workers (e.g. pi-squad)
  * run a full pi process with the same extensions — so a subagent rechecks
  * its own turns too, since only its final answer reaches the orchestrator.
- * All agents in one cwd share the single state file; the prompt tells them
- * to re-read before writing and merge, not clobber.
+ * All agents in one cwd share the single state file; the prompt gives each
+ * agent its own `## <agent name>` section and tells it to edit only that
+ * section — containment for the read-modify-write race under parallel agents.
  *
  * Asset chain per prompt file (first non-blank hit wins): $PI_RECHECK_ASSETS_DIR
  * → <cwd>/.pi/pi-recheck-hook/assets → global extension-data assets → bundled
