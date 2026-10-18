@@ -389,9 +389,11 @@ test("child session (parentSession header) is silenced by subagents:false too", 
 		sessionManager: { getHeader: () => ({ type: "session", id: "child", parentSession: "/sessions/parent.jsonl" }) },
 	};
 	await withHome(makeHome(), async () => {
-		const { handlers } = setup();
+		const { handlers, sent } = setup();
 		const res = handlers.agent_before_settle(assistantSettle("child-off"), childCtx);
 		assert.ok(!res || !res.entries, "child sessions must respect subagents:false");
+		handlers.session_compact(compactEvent("child-off"), childCtx);
+		assert.equal(sent.length, 0, "child compaction must respect subagents:false");
 	});
 });
 
@@ -735,6 +737,19 @@ test("/recheck on|off preserves other settings keys (subagents)", async () => {
 		readFileSync(join(cwd, ".pi", "pi-recheck-hook", "settings.json"), "utf8"),
 		'{\n  "enabled": true,\n  "subagents": false\n}\n',
 		"the rewrite must keep the subagents key",
+	);
+});
+
+test("/recheck on over a settings.json that is a JSON array starts fresh instead of corrupting", async () => {
+	clearEnv();
+	const cwd = makeProject({ settings: "[1, 2]" });
+	const { commands } = setup();
+	const ctx = { cwd, ui: { notify: () => {} } };
+	await commands.recheck.handler("on", ctx);
+	assert.equal(
+		readFileSync(join(cwd, ".pi", "pi-recheck-hook", "settings.json"), "utf8"),
+		'{\n  "enabled": true\n}\n',
+		"a non-object settings file must be replaced, not spread",
 	);
 });
 

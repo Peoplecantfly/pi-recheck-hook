@@ -77,13 +77,14 @@ function homeDir(): string | undefined {
 	return home && home !== "" ? home : undefined;
 }
 
-/** Read `{ "enabled": boolean }`; anything else (bad JSON, wrong type) is absent. */
-function readEnabledFlag(path: string): boolean | null {
+/** Read a boolean settings key; anything else (missing file, bad JSON,
+ * non-object, array, or wrong type) is absent. */
+function readFlag(path: string, key: "enabled" | "subagents"): boolean | null {
 	try {
 		if (!existsSync(path)) return null;
 		const data = JSON.parse(readFileSync(path, "utf8"));
-		if (typeof data !== "object" || data === null) return null;
-		const flag = (data as Record<string, unknown>).enabled;
+		if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+		const flag = (data as Record<string, unknown>)[key];
 		return typeof flag === "boolean" ? flag : null;
 	} catch {
 		return null;
@@ -96,28 +97,15 @@ function isEnabled(cwd: string): boolean {
 	if (env === "0" || env === "false" || env === "off") return false;
 	if (env === "1" || env === "true" || env === "on") return true;
 
-	const project = readEnabledFlag(join(cwd, CONFIG_DIR, "settings.json"));
+	const project = readFlag(join(cwd, CONFIG_DIR, "settings.json"), "enabled");
 	if (project !== null) return project;
 
 	const home = homeDir();
 	if (home) {
-		const global = readEnabledFlag(join(home, GLOBAL_STATE_DIR, "settings.json"));
+		const global = readFlag(join(home, GLOBAL_STATE_DIR, "settings.json"), "enabled");
 		if (global !== null) return global;
 	}
 	return false; // default: OFF — the hook only works when switched on
-}
-
-/** Read `{ "subagents": boolean }`; anything else (bad JSON, wrong type) is absent. */
-function readSubagentsFlag(path: string): boolean | null {
-	try {
-		if (!existsSync(path)) return null;
-		const data = JSON.parse(readFileSync(path, "utf8"));
-		if (typeof data !== "object" || data === null) return null;
-		const flag = (data as Record<string, unknown>).subagents;
-		return typeof flag === "boolean" ? flag : null;
-	} catch {
-		return null;
-	}
 }
 
 /** Do the hooks fire in subagent/child sessions? Default TRUE — the
@@ -126,11 +114,11 @@ function readSubagentsFlag(path: string): boolean | null {
  * (project → global). There is no env-var switch for this: $PI_RECHECK
  * remains the global kill switch. */
 function areSubagentsEnabled(cwd: string): boolean {
-	const project = readSubagentsFlag(join(cwd, CONFIG_DIR, "settings.json"));
+	const project = readFlag(join(cwd, CONFIG_DIR, "settings.json"), "subagents");
 	if (project !== null) return project;
 	const home = homeDir();
 	if (home) {
-		const global = readSubagentsFlag(join(home, GLOBAL_STATE_DIR, "settings.json"));
+		const global = readFlag(join(home, GLOBAL_STATE_DIR, "settings.json"), "subagents");
 		if (global !== null) return global;
 	}
 	return true;
@@ -227,7 +215,7 @@ export default function (pi: ExtensionAPI) {
 					let existing: Record<string, unknown> = {};
 					try {
 						const parsed = JSON.parse(readFileSync(path, "utf8"));
-						if (typeof parsed === "object" && parsed !== null) existing = parsed as Record<string, unknown>;
+						if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) existing = parsed as Record<string, unknown>;
 					} catch {
 						// Missing or broken file — start fresh.
 					}
