@@ -52,7 +52,11 @@ extensions — so each subagent rechecks its own turns, since only its final ans
 orchestrator. All agents in one cwd share the single state file; the prompt gives each
 agent its own `## <agent name>` section and tells it to edit only that section. Set
 `"subagents": false` in `settings.json` (project or global) to silence both hooks in exactly
-those sessions — the main session keeps running (see Scope).
+those sessions — the main session keeps running (see Scope). The flag is read from the
+session's own cwd: a process-spawned worker in a git worktree has no project `settings.json`
+(`.pi/pi-recheck-hook` is local-only, gitignored), so it falls back to the global file —
+for worktree workers set `subagents` globally, or use `PI_RECHECK=0` (inherited by child
+processes) as the universal kill switch.
 
 ## Layout
 
